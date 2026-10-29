@@ -3,3 +3,4 @@ logs/
 mitm_mcp_traffic.db
 .aider*
 .ptc-ref-*
+.codegraph/
