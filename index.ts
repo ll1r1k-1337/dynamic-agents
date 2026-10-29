@@ -210,7 +210,7 @@ export default class DynamicAgentsExtension implements Extension {
         };
 
         if (mode === 'orchestrator') {
-            return [{ ...runDynamicAgent, description: ORCHESTRATOR_DESCRIPTION } as ToolDefinition];
+            return [{ ...runDynamicAgent, description: ORCHESTRATOR_DESCRIPTION } as unknown as ToolDefinition];
         }
 
         return [runDynamicAgent, listDynamicSubagents];
