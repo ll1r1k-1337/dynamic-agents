@@ -1,3 +1,4 @@
 node_modules/
 logs/
 mitm_mcp_traffic.db
+.aider*
