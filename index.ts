@@ -76,6 +76,39 @@ const ORCHESTRATOR_DESCRIPTION = [
     '- Do not write code or answer questions yourself — delegate everything to dynamic agents.',
 ].join('\n');
 
+const ORCHESTRATOR_AGENT_PROFILE: AgentProfile = {
+    id: 'dynamic-agents-orchestrator',
+    name: 'Orchestrator',
+    provider: 'openai-compatible',
+    model: 'non-stop',
+    maxIterations: 50,
+    minTimeBetweenToolCalls: 0,
+    systemPrompt: ORCHESTRATOR_USER_MESSAGE,
+    enabledServers: [],
+    toolApprovals: {},
+    toolSettings: {},
+    disabledExtensionTools: [],
+    includeContextFiles: false,
+    includeRepoMap: false,
+    usePowerTools: true,
+    useAiderTools: false,
+    useTodoTools: true,
+    useSubagents: false,
+    useTaskTools: false,
+    useMemoryTools: false,
+    useSkillsTools: false,
+    useExtensionTools: true,
+    customInstructions: '',
+    subagent: {
+        enabled: false,
+        contextMemory: ContextMemoryMode.Off,
+        systemPrompt: '',
+        invocationMode: InvocationMode.OnDemand,
+        color: '#a78bfa',
+        description: 'Dynamic subagents are provided by the run_dynamic_agent extension tool.',
+    },
+};
+
 const runInputSchema = z.object({
     prompt: z.string().min(1).describe('Task for the dynamic agent. Give complete, self-contained instructions.'),
     name: z.string().optional().describe('Session-scoped name. Reusing the same name reuses the same profile.'),
@@ -84,6 +117,8 @@ const runInputSchema = z.object({
     model: z.string().optional(),
     maxIterations: z.number().int().min(0).optional(),
     includeContextFiles: z.boolean().optional(),
+    useAiderTools: z.boolean().optional().describe('Override the parent useAiderTools for this agent.'),
+    usePowerTools: z.boolean().optional().describe('Override the parent usePowerTools for this agent.'),
 });
 
 const listInputSchema = z.object({});
@@ -96,15 +131,17 @@ interface DynamicEntry {
 export default class DynamicAgentsExtension implements Extension {
     static metadata = {
         name: 'Dynamic Agents',
-        version: '1.1.0',
+        version: '1.3.0',
         description: 'Spawns ephemeral session-scoped subagents from inline profiles. Nothing is written to disk.',
         author: 'local',
-        capabilities: ['tools', 'modes'],
+        capabilities: ['tools', 'modes', 'agents'],
     };
 
     private sessions = new Map<string, Map<string, DynamicEntry>>();
 
     private results = new Map<string, string>();
+
+    private orchestratorProfileEdits = new Map<string, AgentProfile>();
 
     getModes(_context: ExtensionContext): ModeDefinition[] {
         return [
@@ -117,6 +154,20 @@ export default class DynamicAgentsExtension implements Extension {
         ];
     }
 
+    getAgents(_context: ExtensionContext): AgentProfile[] {
+        return [this.orchestratorProfileEdits.get('dynamic-agents-orchestrator') ?? ORCHESTRATOR_AGENT_PROFILE];
+    }
+
+    async onAgentProfileUpdated(
+        _context: ExtensionContext,
+        agentId: string,
+        updatedProfile: AgentProfile,
+    ): Promise<AgentProfile> {
+        // Profile edits are kept for the session only; the extension stores nothing on disk.
+        this.orchestratorProfileEdits.set(agentId, updatedProfile);
+        return updatedProfile;
+    }
+
     onLoad(context: ExtensionContext): void {
         context.addDisposable(() => () => {
             this.sessions.clear();
@@ -124,7 +175,7 @@ export default class DynamicAgentsExtension implements Extension {
         });
     }
 
-    async onAgentStarted(event: AgentStartedEvent, context: ExtensionContext): Promise<Partial<AgentStartedEvent>> {
+    async onAgentStarted(event: AgentStartedEvent, context: ExtensionContext): Promise<void | Partial<AgentStartedEvent>> {
         if (event.mode !== 'orchestrator') {
             return undefined;
         }
@@ -163,7 +214,7 @@ export default class DynamicAgentsExtension implements Extension {
             name: 'run_dynamic_agent',
             description: [
                 'Runs a dynamic agent with an inline profile.',
-                'The subagent inherits the current agent tools and model.',
+                'The subagent inherits the current agent tools and model unless useAiderTools or usePowerTools overrides are passed.',
                 'The run is isolated and returns only the final text.',
                 'The profile lives in memory for the current task session and never touches disk.',
             ].join(' '),
@@ -191,7 +242,9 @@ export default class DynamicAgentsExtension implements Extension {
                     input.provider !== undefined ||
                     input.model !== undefined ||
                     input.maxIterations !== undefined ||
-                    input.includeContextFiles !== undefined;
+                    input.includeContextFiles !== undefined ||
+                    input.useAiderTools !== undefined ||
+                    input.usePowerTools !== undefined;
 
                 let entry = session.get(name);
                 if (!entry) {
@@ -268,6 +321,8 @@ export default class DynamicAgentsExtension implements Extension {
             model: input.model ?? base.model,
             maxIterations: input.maxIterations ?? base.maxIterations,
             includeContextFiles: input.includeContextFiles ?? base.includeContextFiles,
+            useAiderTools: input.useAiderTools ?? base.useAiderTools,
+            usePowerTools: input.usePowerTools ?? base.usePowerTools,
             isSubagent: true,
             useSubagents: false,
             useTodoTools: false,

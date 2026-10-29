@@ -11,11 +11,13 @@ Runs one task in a temporary subagent and returns the final text only.
 | Argument | Type | Required | Purpose |
 | --- | --- | --- | --- |
 | `prompt` | string | yes | Task for the subagent. Give complete, self-contained instructions. |
-| `name` | string | no | Session-scoped name. Reusing the same name with no other overrides reuses the same profile; any new override (systemPrompt, provider, model, maxIterations, includeContextFiles) rebuilds the profile. |
+| `name` | string | no | Session-scoped name. Reusing the same name with no other overrides reuses the same profile; any new override (systemPrompt, provider, model, maxIterations, includeContextFiles, useAiderTools, usePowerTools) rebuilds the profile. |
 | `systemPrompt` | string | no | Instructions for the subagent. Also used as its description. |
 | `provider` | string | no | LLM provider. Defaults to the parent agent provider. |
 | `model` | string | no | Model. Defaults to the parent agent model. |
 | `maxIterations` | integer | no | Iteration limit. Defaults to the parent agent limit. |
+| `useAiderTools` | boolean | no | Override the parent useAiderTools for this agent. |
+| `usePowerTools` | boolean | no | Override the parent usePowerTools for this agent. |
 | `includeContextFiles` | boolean | no | Add the task context files to the subagent run. |
 
 Result text is cut at 20000 characters. The tail shows the count of removed characters.
