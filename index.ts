@@ -7,6 +7,7 @@ import type {
     ContextMessage,
     Extension,
     ExtensionContext,
+    ModeDefinition,
     SubagentFinishedEvent,
     TaskClosedEvent,
     TaskDeletedEvent,
@@ -50,6 +51,18 @@ const truncate = (value: string): string => {
     return `${value.slice(0, MAX_RESULT_CHARS)}\n\n[...truncated ${removed} chars]`;
 };
 
+const ORCHESTRATOR_DESCRIPTION = [
+    'ORCHESTRATOR MODE. You are an orchestrator. Do NOT solve the task yourself.',
+    'Instead:',
+    '1. Decompose the user task into small, independent subtasks.',
+    '2. Call run_dynamic_agent once per subtask with a complete, self-contained prompt.',
+    '3. After all subtasks finish, synthesize the results into a final answer.',
+    'Rules:',
+    '- Each subtask prompt must be fully self-contained (no references to other subtask results unless you pass them explicitly).',
+    '- Prefer parallel execution: call multiple run_dynamic_agent tools in the same turn when subtasks are independent.',
+    '- Do not write code or answer questions yourself — delegate everything to dynamic agents.',
+].join('\n');
+
 const runInputSchema = z.object({
     prompt: z.string().min(1).describe('Task for the dynamic agent. Give complete, self-contained instructions.'),
     name: z.string().optional().describe('Session-scoped name. Reusing the same name reuses the same profile.'),
@@ -80,6 +93,17 @@ export default class DynamicAgentsExtension implements Extension {
 
     private results = new Map<string, string>();
 
+    getModes(): ModeDefinition[] {
+        return [
+            {
+                name: 'orchestrator',
+                label: 'Оркестратор',
+                description: 'Декомпозирует задачу на подзадачи и решает каждую через run_dynamic_agent',
+                icon: 'GoProjectRoadmap',
+            },
+        ];
+    }
+
     onLoad(context: ExtensionContext): void {
         context.addDisposable(() => () => {
             this.sessions.clear();
@@ -103,7 +127,7 @@ export default class DynamicAgentsExtension implements Extension {
         this.dropTask(event.task.id);
     }
 
-    getTools(context: ExtensionContext, _mode: string, agentProfile: AgentProfile): ToolDefinition[] {
+    getTools(context: ExtensionContext, mode: string, agentProfile: AgentProfile): ToolDefinition[] {
         const runDynamicAgent: ToolDefinition<typeof runInputSchema> = {
             name: 'run_dynamic_agent',
             description: [
@@ -184,6 +208,10 @@ export default class DynamicAgentsExtension implements Extension {
                 return lines.join('\n');
             },
         };
+
+        if (mode === 'orchestrator') {
+            return [{ ...runDynamicAgent, description: ORCHESTRATOR_DESCRIPTION }];
+        }
 
         return [runDynamicAgent, listDynamicSubagents];
     }
