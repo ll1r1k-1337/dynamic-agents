@@ -51,7 +51,7 @@ const truncate = (value: string): string => {
 };
 
 const runInputSchema = z.object({
-    prompt: z.string().min(1).describe('Task for the temporary subagent. Give complete, self-contained instructions.'),
+    prompt: z.string().min(1).describe('Task for the dynamic agent. Give complete, self-contained instructions.'),
     name: z.string().optional().describe('Session-scoped name. Reusing the same name reuses the same profile.'),
     systemPrompt: z.string().optional(),
     provider: z.string().optional(),
@@ -62,21 +62,21 @@ const runInputSchema = z.object({
 
 const listInputSchema = z.object({});
 
-interface TempEntry {
+interface DynamicEntry {
     profile: AgentProfile;
     calls: number;
 }
 
-export default class TempSubagentsExtension implements Extension {
+export default class DynamicAgentsExtension implements Extension {
     static metadata = {
-        name: 'Temp Subagents',
+        name: 'Dynamic Agents',
         version: '1.0.0',
         description: 'Spawns ephemeral session-scoped subagents from inline profiles. Nothing is written to disk.',
         author: 'local',
         capabilities: ['tools'],
     };
 
-    private sessions = new Map<string, Map<string, TempEntry>>();
+    private sessions = new Map<string, Map<string, DynamicEntry>>();
 
     private results = new Map<string, string>();
 
@@ -89,7 +89,7 @@ export default class TempSubagentsExtension implements Extension {
 
     async onSubagentFinished(event: SubagentFinishedEvent): Promise<void> {
         const profileId = event.subagentProfile.id;
-        if (!profileId.startsWith('temp-')) {
+        if (!profileId.startsWith('dynamic-agents-')) {
             return;
         }
         this.results.set(profileId, lastAssistantText(event.resultMessages));
@@ -104,10 +104,10 @@ export default class TempSubagentsExtension implements Extension {
     }
 
     getTools(context: ExtensionContext, _mode: string, agentProfile: AgentProfile): ToolDefinition[] {
-        const runTempSubagent: ToolDefinition<typeof runInputSchema> = {
-            name: 'run_temp_subagent',
+        const runDynamicAgent: ToolDefinition<typeof runInputSchema> = {
+            name: 'run_dynamic_agent',
             description: [
-                'Runs a temporary subagent with an inline profile.',
+                'Runs a dynamic agent with an inline profile.',
                 'The subagent inherits the current agent tools and model.',
                 'The run is isolated and returns only the final text.',
                 'The profile lives in memory for the current task session and never touches disk.',
@@ -119,15 +119,15 @@ export default class TempSubagentsExtension implements Extension {
                     return 'Error: no active task context.';
                 }
                 if (agentProfile.isSubagent) {
-                    return 'Error: a subagent cannot spawn temporary subagents.';
+                    return 'Error: a subagent cannot spawn dynamic agents.';
                 }
 
                 const taskId = taskContext.data.id;
-                const name = input.name?.trim() || `Temp ${randomUUID().slice(0, 8)}`;
+                const name = input.name?.trim() || `Dynamic ${randomUUID().slice(0, 8)}`;
 
                 let session = this.sessions.get(taskId);
                 if (!session) {
-                    session = new Map<string, TempEntry>();
+                    session = new Map<string, DynamicEntry>();
                     this.sessions.set(taskId, session);
                 }
 
@@ -154,13 +154,13 @@ export default class TempSubagentsExtension implements Extension {
                     await taskContext.runSubagent(entry.profile, input.prompt);
                 } catch (error) {
                     const message = error instanceof Error ? error.message : String(error);
-                    return `Error: temp subagent "${name}" failed: ${message}`;
+                    return `Error: dynamic agent "${name}" failed: ${message}`;
                 }
 
                 const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
                 const text = this.results.get(entry.profile.id) ?? '';
                 if (!text) {
-                    return `Temp subagent "${name}" finished in ${seconds}s with no text output.`;
+                    return `Dynamic agent "${name}" finished in ${seconds}s with no text output.`;
                 }
 
                 return `${name} (${entry.profile.provider}/${entry.profile.model}, ${seconds}s):\n\n${truncate(text)}`;
