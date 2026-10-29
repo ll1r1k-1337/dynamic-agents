@@ -175,7 +175,7 @@ export default class DynamicAgentsExtension implements Extension {
                 const taskContext = context.getTaskContext();
                 const session = taskContext ? this.sessions.get(taskContext.data.id) : undefined;
                 if (!session || session.size === 0) {
-                    return 'No temporary subagents in this session.';
+                    return 'No dynamic agents in this session.';
                 }
                 const lines = [...session.entries()].map(
                     ([name, entry]) =>
