@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { ContextMemoryMode, InvocationMode } from '@aiderdesk/extensions';
 import type {
     AgentProfile,
+    AgentStartedEvent,
     ContextMessage,
     Extension,
     ExtensionContext,
@@ -13,6 +14,18 @@ import type {
     TaskDeletedEvent,
     ToolDefinition,
 } from '@aiderdesk/extensions';
+
+const ORCHESTRATOR_USER_MESSAGE = `You are in orchestrator mode. Your primary tool is run_dynamic_agent.
+
+Work in these steps:
+1. Decompose the user's task into small, focused subtasks. Each subtask must have a clear scope and a verifiable outcome.
+2. Delegate each subtask to run_dynamic_agent with an inline profile: a short name, a role description, and a precise task prompt that includes all needed context (file paths, constraints, expected output).
+3. Run independent subtasks in parallel when possible.
+4. Verify each returned result against the subtask outcome. Re-run a subtask with a refined prompt when the result is incomplete or wrong.
+5. Do not implement subtasks yourself. Do the work yourself only when delegation is impossible or failed twice.
+6. Aggregate the verified results and give the user a final summary: what was done, which files changed, and any open issues.`;
+
+const ORCHESTRATOR_ASSISTANT_MESSAGE = `OK, I will decompose the task, delegate subtasks to dynamic agents, and aggregate their results.`;
 
 const MAX_RESULT_CHARS = 20000;
 
@@ -86,20 +99,20 @@ export default class DynamicAgentsExtension implements Extension {
         version: '1.0.0',
         description: 'Spawns ephemeral session-scoped subagents from inline profiles. Nothing is written to disk.',
         author: 'local',
-        capabilities: ['tools'],
+        capabilities: ['tools', 'modes'],
     };
 
     private sessions = new Map<string, Map<string, DynamicEntry>>();
 
     private results = new Map<string, string>();
 
-    getModes(): ModeDefinition[] {
+    getModes(_context: ExtensionContext): ModeDefinition[] {
         return [
             {
                 name: 'orchestrator',
-                label: 'Оркестратор',
-                description: 'Декомпозирует задачу на подзадачи и решает каждую через run_dynamic_agent',
-                icon: 'GoProjectRoadmap',
+                label: 'Orchestrator',
+                description: 'Decomposes the task into subtasks and delegates them to dynamic subagents',
+                icon: 'GoStack',
             },
         ];
     }
@@ -109,6 +122,24 @@ export default class DynamicAgentsExtension implements Extension {
             this.sessions.clear();
             this.results.clear();
         });
+    }
+
+    async onAgentStarted(event: AgentStartedEvent, context: ExtensionContext): Promise<Partial<AgentStartedEvent>> {
+        if (event.mode !== 'orchestrator') {
+            return undefined;
+        }
+        context.log('Orchestrator mode active - prepending orchestration instructions to context messages', 'info');
+        const orchestratorUserMessage = {
+            id: 'dynamic-agents-orchestrator-user',
+            role: 'user' as const,
+            content: ORCHESTRATOR_USER_MESSAGE,
+        };
+        const orchestratorAssistantMessage = {
+            id: 'dynamic-agents-orchestrator-assistant',
+            role: 'assistant' as const,
+            content: ORCHESTRATOR_ASSISTANT_MESSAGE,
+        };
+        return { contextMessages: [orchestratorUserMessage, orchestratorAssistantMessage, ...event.contextMessages] };
     }
 
     async onSubagentFinished(event: SubagentFinishedEvent): Promise<void> {
