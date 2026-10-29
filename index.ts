@@ -185,7 +185,7 @@ export default class DynamicAgentsExtension implements Extension {
             },
         };
 
-        return [runTempSubagent, listTempSubagents];
+        return [runDynamicAgent, listDynamicSubagents];
     }
 
     private buildProfile(
@@ -203,7 +203,7 @@ export default class DynamicAgentsExtension implements Extension {
 
         return {
             ...base,
-            id: `temp-${taskId}-${slug}`,
+            id: `dynamic-agents-${taskId}-${slug}`,
             name,
             provider: input.provider ?? base.provider,
             model: input.model ?? base.model,
@@ -218,7 +218,7 @@ export default class DynamicAgentsExtension implements Extension {
                 enabled: true,
                 invocationMode: InvocationMode.OnDemand,
                 systemPrompt,
-                description: systemPrompt || `Temporary subagent ${name}`,
+                description: systemPrompt || `Dynamic agent ${name}`,
                 contextMemory: ContextMemoryMode.Off,
             },
         };
