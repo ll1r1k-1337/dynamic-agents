@@ -167,9 +167,9 @@ export default class DynamicAgentsExtension implements Extension {
             },
         };
 
-        const listTempSubagents: ToolDefinition<typeof listInputSchema> = {
-            name: 'list_temp_subagents',
-            description: 'Lists temporary subagents created in the current session.',
+        const listDynamicSubagents: ToolDefinition<typeof listInputSchema> = {
+            name: 'list_dynamic_subagents',
+            description: 'Lists dynamic subagents created in the current session.',
             inputSchema: listInputSchema,
             execute: async () => {
                 const taskContext = context.getTaskContext();
