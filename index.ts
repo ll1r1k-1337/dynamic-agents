@@ -96,7 +96,7 @@ interface DynamicEntry {
 export default class DynamicAgentsExtension implements Extension {
     static metadata = {
         name: 'Dynamic Agents',
-        version: '1.0.0',
+        version: '1.1.0',
         description: 'Spawns ephemeral session-scoped subagents from inline profiles. Nothing is written to disk.',
         author: 'local',
         capabilities: ['tools', 'modes'],
