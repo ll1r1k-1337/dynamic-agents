@@ -1,0 +1,5 @@
+{
+  "defaultGoalMaxRounds": 0,
+  "defaultDebateRounds": 0,
+  "defaultIdleTimeoutSeconds": 180
+}
