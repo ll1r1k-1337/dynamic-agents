@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
@@ -100,7 +100,9 @@ export const writeExtensionConfig = (
                 ? config.enableAllMcpServersByDefault
                 : current.enableAllMcpServersByDefault,
     };
-    writeFileSync(targetPath, JSON.stringify(merged, null, 2), 'utf-8');
+    const tmpPath = `${targetPath}.tmp.${Date.now()}`;
+    writeFileSync(tmpPath, JSON.stringify(merged, null, 2), 'utf-8');
+    renameSync(tmpPath, targetPath);
     return merged;
 };
 
@@ -134,6 +136,9 @@ export const textFromContent = (content: unknown): string => {
 export const extractResultText = (messages: readonly ContextMessage[]): string => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
         const message = messages[index];
+        if (!message) {
+            continue;
+        }
         if (message.role === 'assistant') {
             const text = textFromContent(message.content).trim();
             if (text.length > 0) {
@@ -143,6 +148,9 @@ export const extractResultText = (messages: readonly ContextMessage[]): string =
     }
     for (let index = messages.length - 1; index >= 0; index -= 1) {
         const message = messages[index];
+        if (!message) {
+            continue;
+        }
         if (message.role === 'tool') {
             let text = textFromContent(message.content).trim();
             if (!text && typeof message.content === 'object' && message.content !== null) {
@@ -371,14 +379,15 @@ export const parseGoalVerdict = (text: string): GoalVerdict => {
 export const stripGoalVerdictLine = (text: string): string => {
     const lines = text.split('\n');
     let endIndex = lines.length - 1;
-    while (endIndex >= 0 && lines[endIndex].trim().length === 0) {
+    while (endIndex >= 0 && (lines[endIndex]?.trim().length ?? 0) === 0) {
         endIndex -= 1;
     }
-    if (endIndex < 0 || !lines[endIndex].trim().startsWith('GOAL:')) {
+    const endLine = lines[endIndex];
+    if (endIndex < 0 || !endLine || !endLine.trim().startsWith('GOAL:')) {
         return text;
     }
     const kept = lines.slice(0, endIndex);
-    while (kept.length > 0 && kept[kept.length - 1].trim().length === 0) {
+    while (kept.length > 0 && (kept[kept.length - 1]?.trim().length ?? 0) === 0) {
         kept.pop();
     }
     return kept.join('\n');
@@ -550,6 +559,9 @@ export const parseDebateVerdict = (text: string): DebateVerdict => {
         return { kind: 'absent' };
     }
     const last = lines[lines.length - 1];
+    if (!last) {
+        return { kind: 'absent' };
+    }
     if (last === 'DEBATE: agree') {
         return { kind: 'agree' };
     }
@@ -569,7 +581,8 @@ export const stripDebateVerdictLine = (text: string): string => {
     const lines = text.split('\n');
     let lastNonEmptyIndex = -1;
     for (let i = lines.length - 1; i >= 0; i -= 1) {
-        if (lines[i].trim().length > 0) {
+        const currentLine = lines[i];
+        if (currentLine !== undefined && currentLine.trim().length > 0) {
             lastNonEmptyIndex = i;
             break;
         }
@@ -577,8 +590,8 @@ export const stripDebateVerdictLine = (text: string): string => {
     if (lastNonEmptyIndex === -1) {
         return text;
     }
-    const trimmed = lines[lastNonEmptyIndex].trim();
-    if (trimmed.startsWith('DEBATE:')) {
+    const targetLine = lines[lastNonEmptyIndex];
+    if (targetLine?.trim().startsWith('DEBATE:')) {
         return lines.slice(0, lastNonEmptyIndex).join('\n').trimEnd();
     }
     return text;
@@ -1495,6 +1508,21 @@ export default class DynamicAgentsExtension implements Extension {
     ): Promise<undefined | Partial<ResponseChunkEvent>> {
         const chunk = event.chunk?.chunk;
         if (!chunk) {
+            return undefined;
+        }
+        const targetedEvent = event as unknown as {
+            agentId?: string;
+            subagentId?: string;
+            agentProfile?: { id?: string };
+        };
+        const targetId =
+            targetedEvent.agentId ?? targetedEvent.subagentId ?? targetedEvent.agentProfile?.id;
+        if (targetId) {
+            const tracker = this.activeSubagents.get(targetId);
+            if (tracker) {
+                tracker.resetTimer();
+                tracker.streamedText = (tracker.streamedText + chunk).slice(-16384);
+            }
             return undefined;
         }
         for (const tracker of this.activeSubagents.values()) {

@@ -223,6 +223,31 @@ describe('buildProfile', () => {
         assert.ok(profile.systemPrompt?.includes('Follow company standards.'));
     });
 
+    it('prepends preset instructions for all supported presets', () => {
+        const base = createMockBaseProfile();
+        const presets: Array<keyof typeof AGENT_PRESETS> = [
+            'reviewer',
+            'tester',
+            'architect',
+            'refactorer',
+            'researcher',
+        ];
+        for (const preset of presets) {
+            const profile = buildProfile(
+                base,
+                'task-preset',
+                {
+                    prompt: 'Do work',
+                    systemPrompt: 'My custom instruction',
+                    preset,
+                },
+                `${preset}-agent`,
+            );
+            assert.ok(profile.systemPrompt?.includes(AGENT_PRESETS[preset]));
+            assert.ok(profile.systemPrompt?.includes('My custom instruction'));
+        }
+    });
+
     it('passes input.maxTokens to the profile', () => {
         const base = createMockBaseProfile();
         const profile = buildProfile(
@@ -356,12 +381,12 @@ describe('DynamicAgentsExtension', () => {
 
         const modes = ext.getModes(context);
         assert.equal(modes.length, 1);
-        assert.equal(modes[0].name, 'orchestrator');
+        assert.equal(modes[0]?.name, 'orchestrator');
 
         const agents = ext.getAgents(context);
         assert.equal(agents.length, 1);
-        assert.equal(agents[0].id, 'dynamic-agents-orchestrator');
-        assert.equal(agents[0].maxTokens, 16384);
+        assert.equal(agents[0]?.id, 'dynamic-agents-orchestrator');
+        assert.equal(agents[0]?.maxTokens, 16384);
     });
 
     it('provides all tools in orchestrator mode', () => {
@@ -403,8 +428,8 @@ describe('DynamicAgentsExtension', () => {
         await ext.onSubagentStarted(event as never, context);
 
         assert.equal(event.contextFiles.length, 3);
-        assert.equal(event.contextFiles[1].path, 'src/main.ts');
-        assert.equal(event.contextFiles[2].path, 'src/utils.ts');
+        assert.equal(event.contextFiles[1]?.path, 'src/main.ts');
+        assert.equal(event.contextFiles[2]?.path, 'src/utils.ts');
         assert.equal(
             (
                 ext as unknown as { pendingContextFiles: Map<string, string[]> }
@@ -437,6 +462,47 @@ describe('DynamicAgentsExtension', () => {
 
         await ext.onResponseChunk({ chunk: { chunk: 'streaming output text' } } as never, context);
         assert.equal(tracker.streamedText, 'streaming output text');
+    });
+
+    it('accumulates response chunks only for target agent if agentId is provided', async () => {
+        const ext = new DynamicAgentsExtension();
+        const context = createMockContext();
+        let reset1Called = false;
+        let reset2Called = false;
+        const tracker1 = {
+            resetTimer: () => {
+                reset1Called = true;
+            },
+            cancelTimer: () => {},
+            stepsCount: 0,
+            toolCallsCount: 0,
+            startedAt: Date.now(),
+            streamedText: '',
+        };
+        const tracker2 = {
+            resetTimer: () => {
+                reset2Called = true;
+            },
+            cancelTimer: () => {},
+            stepsCount: 0,
+            toolCallsCount: 0,
+            startedAt: Date.now(),
+            streamedText: '',
+        };
+        const activeSubagents = (
+            ext as unknown as { activeSubagents: Map<string, typeof tracker1> }
+        ).activeSubagents;
+        activeSubagents.set('agent-1', tracker1);
+        activeSubagents.set('agent-2', tracker2);
+
+        await ext.onResponseChunk(
+            { chunk: { chunk: 'chunk-for-agent-1' }, agentId: 'agent-1' } as never,
+            context,
+        );
+        assert.equal(tracker1.streamedText, 'chunk-for-agent-1');
+        assert.equal(reset1Called, true);
+        assert.equal(tracker2.streamedText, '');
+        assert.equal(reset2Called, false);
     });
 
     it('does not duplicate orchestrator messages if already present in contextMessages', async () => {
@@ -557,6 +623,67 @@ describe('DynamicAgentsExtension', () => {
             {},
         );
         assert.equal(result, 'Error: operation aborted.');
+    });
+
+    it('aborts goal and debate tools when signal is already aborted', async () => {
+        const ext = new DynamicAgentsExtension();
+        const context = createMockContext();
+        const base = createMockBaseProfile();
+        const tools = ext.getTools(context, 'orchestrator', base);
+        const goalTool = tools.find((t) => t.name === 'run_dynamic_agent_goal');
+        const debateTool = tools.find((t) => t.name === 'run_agent_debate');
+        assert.ok(goalTool);
+        assert.ok(debateTool);
+
+        const execContext = {
+            ...context,
+            getTaskContext: () => ({
+                data: { id: 'task-abort-test' },
+            }),
+        } as unknown as ExtensionContext;
+
+        const controller = new AbortController();
+        controller.abort();
+
+        const goalResult = await goalTool.execute(
+            { goal: 'should abort' },
+            controller.signal,
+            execContext,
+            {},
+        );
+        assert.equal(goalResult, 'Error: operation aborted.');
+
+        const debateResult = await debateTool.execute(
+            { topic: 'should abort' },
+            controller.signal,
+            execContext,
+            {},
+        );
+        assert.equal(debateResult, 'Error: operation aborted.');
+    });
+
+    it('executes list_dynamic_subagents tool and returns session subagents summary', async () => {
+        const ext = new DynamicAgentsExtension();
+        const context = createMockContext();
+        const base = createMockBaseProfile();
+        const tools = ext.getTools(context, 'orchestrator', base);
+        const listTool = tools.find((t) => t.name === 'list_dynamic_subagents');
+        assert.ok(listTool);
+
+        const execContext = {
+            ...context,
+            getTaskContext: () => ({
+                data: { id: 'task-list-1' },
+            }),
+        } as unknown as ExtensionContext;
+
+        const emptyResult = (await listTool.execute(
+            { reason: 'testing' },
+            undefined,
+            execContext,
+            {},
+        )) as string;
+        assert.ok(emptyResult.includes('No dynamic agents in this session.'));
     });
 
     it('cleans pendingContextFiles matching task prefix on onTaskClosed', async () => {
@@ -1058,13 +1185,13 @@ describe('runDebateSequence', () => {
         assert.equal(result.text, 'Synthesis: adopt with conditions.');
         assert.equal(runner.calls.length, 7);
 
-        assert.equal(runner.calls[0].name, 'debate-1-advocate');
-        assert.equal(runner.calls[1].name, 'debate-1-critic');
-        assert.equal(runner.calls[2].name, 'debate-1-advocate');
-        assert.equal(runner.calls[3].name, 'debate-1-critic');
-        assert.equal(runner.calls[4].name, 'debate-1-advocate');
-        assert.equal(runner.calls[5].name, 'debate-1-critic');
-        assert.equal(runner.calls[6].name, 'debate-1-synthesizer');
+        assert.equal(runner.calls[0]?.name, 'debate-1-advocate');
+        assert.equal(runner.calls[1]?.name, 'debate-1-critic');
+        assert.equal(runner.calls[2]?.name, 'debate-1-advocate');
+        assert.equal(runner.calls[3]?.name, 'debate-1-critic');
+        assert.equal(runner.calls[4]?.name, 'debate-1-advocate');
+        assert.equal(runner.calls[5]?.name, 'debate-1-critic');
+        assert.equal(runner.calls[6]?.name, 'debate-1-synthesizer');
 
         const formatted = formatDebateResult(result);
         assert.ok(formatted.startsWith('DEBATE_RESULT: synthesis (rounds 2)'));
@@ -1455,6 +1582,24 @@ describe('resolveEnabledServers', () => {
             try {
                 fs.unlinkSync(tempConfigPath);
             } catch {}
+        }
+    });
+
+    it('writes extension config atomically and creates expected JSON', () => {
+        const tempConfigPath = `/tmp/test-atomic-config-${Date.now()}.json`;
+        try {
+            writeExtensionConfig(
+                { defaultGoalMaxRounds: 5, defaultDebateRounds: 4 },
+                tempConfigPath,
+            );
+            assert.ok(fs.existsSync(tempConfigPath));
+            const content = JSON.parse(fs.readFileSync(tempConfigPath, 'utf-8'));
+            assert.equal(content.defaultGoalMaxRounds, 5);
+            assert.equal(content.defaultDebateRounds, 4);
+        } finally {
+            if (fs.existsSync(tempConfigPath)) {
+                fs.unlinkSync(tempConfigPath);
+            }
         }
     });
 });

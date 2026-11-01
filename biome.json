@@ -9,6 +9,8 @@
         "ignoreUnknown": false,
         "includes": [
             "**/*.ts",
+            "**/*.jsx",
+            "config.json",
             "biome.json",
             "package.json",
             "tsconfig.json",
