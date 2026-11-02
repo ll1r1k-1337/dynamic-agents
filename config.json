@@ -1,5 +1,7 @@
 {
     "defaultGoalMaxRounds": 0,
     "defaultDebateRounds": 0,
-    "defaultIdleTimeoutSeconds": 180
+    "defaultIdleTimeoutSeconds": 180,
+    "enableAllMcpServersByDefault": true,
+    "maxSubagentDepth": 2
 }

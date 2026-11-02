@@ -36,6 +36,8 @@
         localConfig?.enableAllMcpServersByDefault !== undefined
             ? localConfig.enableAllMcpServersByDefault
             : true;
+    const maxSubagentDepth =
+        localConfig?.maxSubagentDepth !== undefined ? localConfig.maxSubagentDepth : 2;
 
     const handleGoalChange = (e) => {
         const val = e.target.value === '' ? 0 : Number(e.target.value);
@@ -58,6 +60,16 @@
         debouncedUpdate({
             ...localConfig,
             defaultIdleTimeoutSeconds: Number.isNaN(val) ? 0 : val,
+        });
+    };
+
+    const handleMaxDepthChange = (e) => {
+        const parsed = Number(e.target.value);
+        const val =
+            e.target.value === '' || Number.isNaN(parsed) || parsed < 1 ? 1 : Math.floor(parsed);
+        debouncedUpdate({
+            ...localConfig,
+            maxSubagentDepth: val,
         });
     };
 
@@ -134,6 +146,27 @@
                     min="0"
                     value={defaultIdleTimeoutSeconds}
                     onChange={handleTimeoutChange}
+                    className="w-32 p-2 text-sm bg-bg-secondary-light border-2 border-border-default rounded focus:outline-none focus:border-border-light text-text-primary"
+                />
+            </div>
+
+            <div className="flex flex-col gap-1">
+                <label
+                    htmlFor="maxSubagentDepth"
+                    className="block text-sm font-medium text-text-primary"
+                >
+                    Max Subagent Depth
+                </label>
+                <p className="text-xs text-text-secondary">
+                    Maximum nesting level for dynamic subagents. Set to 1 for flat subagents only,
+                    or 2+ to allow subagents to spawn child subagents (e.g. inside goal loops).
+                </p>
+                <input
+                    id="maxSubagentDepth"
+                    type="number"
+                    min="1"
+                    value={maxSubagentDepth}
+                    onChange={handleMaxDepthChange}
                     className="w-32 p-2 text-sm bg-bg-secondary-light border-2 border-border-default rounded focus:outline-none focus:border-border-light text-text-primary"
                 />
             </div>

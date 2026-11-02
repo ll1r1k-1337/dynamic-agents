@@ -7,6 +7,7 @@ import type {
     AgentStartedEvent,
     AgentStepFinishedEvent,
     AgentStepStartedEvent,
+    CommandDefinition,
     ContextFile,
     ContextMessage,
     Extension,
@@ -31,6 +32,7 @@ export interface ExtensionConfig {
     defaultDebateRounds?: number;
     defaultIdleTimeoutSeconds?: number;
     enableAllMcpServersByDefault?: boolean;
+    maxSubagentDepth?: number;
 }
 
 export const DEFAULT_CONFIG: ExtensionConfig = {
@@ -38,6 +40,7 @@ export const DEFAULT_CONFIG: ExtensionConfig = {
     defaultDebateRounds: 2,
     defaultIdleTimeoutSeconds: 180,
     enableAllMcpServersByDefault: true,
+    maxSubagentDepth: 2,
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -68,6 +71,10 @@ export const readExtensionConfig = (customPath?: string): ExtensionConfig => {
                     typeof parsed.enableAllMcpServersByDefault === 'boolean'
                         ? parsed.enableAllMcpServersByDefault
                         : DEFAULT_CONFIG.enableAllMcpServersByDefault,
+                maxSubagentDepth:
+                    typeof parsed.maxSubagentDepth === 'number'
+                        ? parsed.maxSubagentDepth
+                        : DEFAULT_CONFIG.maxSubagentDepth,
             };
         }
     } catch {
@@ -99,9 +106,13 @@ export const writeExtensionConfig = (
             typeof config.enableAllMcpServersByDefault === 'boolean'
                 ? config.enableAllMcpServersByDefault
                 : current.enableAllMcpServersByDefault,
+        maxSubagentDepth:
+            typeof config.maxSubagentDepth === 'number'
+                ? config.maxSubagentDepth
+                : current.maxSubagentDepth,
     };
     const tmpPath = `${targetPath}.tmp.${Date.now()}`;
-    writeFileSync(tmpPath, JSON.stringify(merged, null, 2), 'utf-8');
+    writeFileSync(tmpPath, `${JSON.stringify(merged, null, 4)}\n`, 'utf-8');
     renameSync(tmpPath, targetPath);
     return merged;
 };
@@ -181,6 +192,92 @@ export const AGENT_PRESETS = {
 } as const;
 
 export type AgentPreset = keyof typeof AGENT_PRESETS;
+
+export interface ParsedCommandArgs {
+    rounds?: number;
+    preset?: string;
+    timeoutSeconds?: number;
+    text: string;
+}
+
+export const parseCommandArgs = (args: string[]): ParsedCommandArgs => {
+    let rounds: number | undefined;
+    let preset: string | undefined;
+    let timeoutSeconds: number | undefined;
+    const textParts: string[] = [];
+
+    const stripQuotes = (val: string): string => {
+        if (
+            val.length >= 2 &&
+            ((val.startsWith('"') && val.endsWith('"')) ||
+                (val.startsWith("'") && val.endsWith("'")))
+        ) {
+            return val.slice(1, -1);
+        }
+        return val;
+    };
+
+    for (let i = 0; i < args.length; i++) {
+        const rawArg = args[i];
+        if (!rawArg) {
+            continue;
+        }
+        const arg = stripQuotes(rawArg);
+
+        if (arg === '-r' || arg === '--rounds') {
+            const next = args[i + 1];
+            if (next !== undefined && /^\d+$/.test(stripQuotes(next))) {
+                rounds = Number.parseInt(stripQuotes(next), 10);
+                i++;
+            } else {
+                textParts.push(arg);
+            }
+        } else if (arg.startsWith('--rounds=')) {
+            const val = stripQuotes(arg.slice('--rounds='.length));
+            if (/^\d+$/.test(val)) {
+                rounds = Number.parseInt(val, 10);
+            } else {
+                textParts.push(arg);
+            }
+        } else if (arg === '-p' || arg === '--preset') {
+            const next = args[i + 1];
+            if (next !== undefined) {
+                preset = stripQuotes(next);
+                i++;
+            } else {
+                textParts.push(arg);
+            }
+        } else if (arg.startsWith('--preset=')) {
+            preset = stripQuotes(arg.slice('--preset='.length));
+        } else if (arg === '-t' || arg === '--timeout') {
+            const next = args[i + 1];
+            if (next !== undefined && /^\d+$/.test(stripQuotes(next))) {
+                timeoutSeconds = Number.parseInt(stripQuotes(next), 10);
+                i++;
+            } else {
+                textParts.push(arg);
+            }
+        } else if (arg.startsWith('--timeout=')) {
+            const val = stripQuotes(arg.slice('--timeout='.length));
+            if (/^\d+$/.test(val)) {
+                timeoutSeconds = Number.parseInt(val, 10);
+            } else {
+                textParts.push(arg);
+            }
+        } else if (i === 0 && /^\d+$/.test(arg)) {
+            rounds = Number.parseInt(arg, 10);
+        } else {
+            textParts.push(arg);
+        }
+    }
+
+    return {
+        rounds,
+        preset,
+        timeoutSeconds,
+        text: textParts.join(' ').trim(),
+    };
+};
 
 const ORCHESTRATOR_DESCRIPTION = [
     'ORCHESTRATOR MODE. You are an orchestrator. Do NOT solve the task yourself.',
@@ -332,6 +429,7 @@ const GOAL_RUNNER_SYSTEM_PROMPT = [
     'You are a goal-driven worker agent.',
     'You receive a goal and work toward it autonomously inside a single reply.',
     'Implement as much as possible, run the given verification steps, and fix what fails.',
+    'You can delegate subtasks or run independent reviews by calling run_dynamic_agent.',
 ].join('\n');
 
 const GOAL_VERDICT_INSTRUCTIONS = [
@@ -1269,7 +1367,7 @@ export default class DynamicAgentsExtension implements Extension {
         description:
             'Spawns ephemeral session-scoped subagents from inline profiles. Nothing is written to disk.',
         author: 'local',
-        capabilities: ['tools', 'modes', 'agents'],
+        capabilities: ['tools', 'modes', 'agents', 'commands'],
     };
 
     private sessions = new Map<string, Map<string, DynamicEntry>>();
@@ -1283,6 +1381,30 @@ export default class DynamicAgentsExtension implements Extension {
     private pendingContextFiles = new Map<string, string[]>();
 
     private debateCounters = new Map<string, number>();
+
+    public configPath?: string;
+
+    private profileDepths = new Map<string, number>();
+
+    private getProfileDepth(profile: AgentProfile): number {
+        const tracked = this.profileDepths.get(profile.id);
+        if (tracked !== undefined) {
+            return tracked;
+        }
+        for (const [id, depth] of this.profileDepths.entries()) {
+            if (profile.id.startsWith(id)) {
+                return depth;
+            }
+        }
+        return profile.isSubagent ? 1 : 0;
+    }
+
+    private getMaxSubagentDepth(): number {
+        const config = readExtensionConfig(this.configPath);
+        return typeof config.maxSubagentDepth === 'number' && config.maxSubagentDepth >= 1
+            ? config.maxSubagentDepth
+            : (DEFAULT_CONFIG.maxSubagentDepth ?? 2);
+    }
 
     getModes(_context: ExtensionContext): ModeDefinition[] {
         return [
@@ -1303,6 +1425,102 @@ export default class DynamicAgentsExtension implements Extension {
         ];
     }
 
+    getCommands(context: ExtensionContext): CommandDefinition[] {
+        return [
+            {
+                name: 'goal',
+                description: 'Run an iterative goal loop toward a verifiable end state',
+                arguments: [
+                    {
+                        description:
+                            'The target goal (e.g. "make all tests pass" or "-r 5 run tests")',
+                        required: true,
+                    },
+                ],
+                execute: async (args: string[], execContext: ExtensionContext): Promise<void> => {
+                    const taskContext =
+                        execContext?.getTaskContext?.() ?? context?.getTaskContext?.();
+                    if (!taskContext) {
+                        context.log('No active task context for /goal command', 'warn');
+                        return;
+                    }
+                    const parsed = parseCommandArgs(args);
+                    if (!parsed.text) {
+                        taskContext.addLogMessage(
+                            'warning',
+                            'Usage: /goal [-r <rounds>] [-p <preset>] [-t <timeout>] <verifiable goal>\nExample: /goal -r 5 npm test passes',
+                        );
+                        return;
+                    }
+
+                    const modifiers: string[] = [];
+                    if (parsed.rounds !== undefined) {
+                        modifiers.push(`maxRounds: ${parsed.rounds}`);
+                    }
+                    if (parsed.preset) {
+                        modifiers.push(`preset: ${parsed.preset}`);
+                    }
+                    if (parsed.timeoutSeconds !== undefined) {
+                        modifiers.push(`idleTimeoutSeconds: ${parsed.timeoutSeconds}`);
+                    }
+
+                    const prompt =
+                        modifiers.length > 0
+                            ? `Achieve this verifiable goal using run_dynamic_agent_goal (${modifiers.join(', ')}):\n${parsed.text}`
+                            : `Achieve this verifiable goal using run_dynamic_agent_goal:\n${parsed.text}`;
+
+                    await taskContext.runPrompt(prompt, 'orchestrator');
+                },
+            },
+            {
+                name: 'debate',
+                description:
+                    'Run a structured debate between advocate and critic agents on a topic',
+                arguments: [
+                    {
+                        description:
+                            'The topic or design decision to debate (e.g. "-r 2 Monorepo vs Polyrepo")',
+                        required: true,
+                    },
+                ],
+                execute: async (args: string[], execContext: ExtensionContext): Promise<void> => {
+                    const taskContext =
+                        execContext?.getTaskContext?.() ?? context?.getTaskContext?.();
+                    if (!taskContext) {
+                        context.log('No active task context for /debate command', 'warn');
+                        return;
+                    }
+                    const parsed = parseCommandArgs(args);
+                    if (!parsed.text) {
+                        taskContext.addLogMessage(
+                            'warning',
+                            'Usage: /debate [-r <rounds>] [-p <preset>] [-t <timeout>] <topic or decision>\nExample: /debate -r 3 TypeScript vs Rust for backend',
+                        );
+                        return;
+                    }
+
+                    const modifiers: string[] = [];
+                    if (parsed.rounds !== undefined) {
+                        modifiers.push(`rounds: ${parsed.rounds}`);
+                    }
+                    if (parsed.preset) {
+                        modifiers.push(`preset: ${parsed.preset}`);
+                    }
+                    if (parsed.timeoutSeconds !== undefined) {
+                        modifiers.push(`idleTimeoutSeconds: ${parsed.timeoutSeconds}`);
+                    }
+
+                    const prompt =
+                        modifiers.length > 0
+                            ? `Conduct a structured debate on this topic using run_agent_debate (${modifiers.join(', ')}):\n${parsed.text}`
+                            : `Conduct a structured debate on this topic using run_agent_debate:\n${parsed.text}`;
+
+                    await taskContext.runPrompt(prompt, 'orchestrator');
+                },
+            },
+        ];
+    }
+
     getConfigComponent(_context: ExtensionContext): string | undefined {
         try {
             if (existsSync(CONFIG_COMPONENT_PATH)) {
@@ -1315,12 +1533,12 @@ export default class DynamicAgentsExtension implements Extension {
     }
 
     async getConfigData(_context: ExtensionContext): Promise<unknown> {
-        return readExtensionConfig();
+        return readExtensionConfig(this.configPath);
     }
 
     async saveConfigData(configData: unknown, _context: ExtensionContext): Promise<unknown> {
         const data = (configData ?? {}) as Partial<ExtensionConfig>;
-        return writeExtensionConfig(data);
+        return writeExtensionConfig(data, this.configPath);
     }
 
     async onAgentProfileUpdated(
@@ -1343,6 +1561,7 @@ export default class DynamicAgentsExtension implements Extension {
             this.results.clear();
             this.orchestratorProfileEdits.clear();
             this.debateCounters.clear();
+            this.profileDepths.clear();
         });
     }
 
@@ -1359,6 +1578,7 @@ export default class DynamicAgentsExtension implements Extension {
         this.results.clear();
         this.orchestratorProfileEdits.clear();
         this.debateCounters.clear();
+        this.profileDepths.clear();
         return undefined;
     }
 
@@ -1383,7 +1603,7 @@ export default class DynamicAgentsExtension implements Extension {
         );
 
         // Populate enabledServers on the orchestrator profile if needed
-        const config = readExtensionConfig();
+        const config = readExtensionConfig(this.configPath);
         if (
             config.enableAllMcpServersByDefault &&
             event.agentProfile &&
@@ -1568,8 +1788,10 @@ export default class DynamicAgentsExtension implements Extension {
                     return 'Error: no active task context found.';
                 }
                 const taskId = taskContext.data.id;
-                if (agentProfile.isSubagent) {
-                    return 'Error: a subagent cannot spawn dynamic agents.';
+                const callerDepth = this.getProfileDepth(agentProfile);
+                const maxDepth = this.getMaxSubagentDepth();
+                if (callerDepth >= maxDepth) {
+                    return `Error: maximum subagent depth (${maxDepth}) reached.`;
                 }
                 if (_signal?.aborted) {
                     return 'Error: operation aborted.';
@@ -1607,6 +1829,7 @@ export default class DynamicAgentsExtension implements Extension {
                     enabledServers: resolvedServers ?? input.enabledServers,
                 };
 
+                const childDepth = callerDepth + 1;
                 let entry = session.get(name);
                 if (!entry) {
                     entry = {
@@ -1617,9 +1840,10 @@ export default class DynamicAgentsExtension implements Extension {
                 } else if (overridesProfile) {
                     entry.profile = buildProfile(agentProfile, taskId, inputWithServers, name);
                 }
+                this.profileDepths.set(entry.profile.id, childDepth);
 
                 entry.calls += 1;
-                const config = readExtensionConfig();
+                const config = readExtensionConfig(this.configPath);
                 const idleTimeoutSeconds =
                     input.idleTimeoutSeconds ?? config.defaultIdleTimeoutSeconds ?? 180;
                 const outcome = await this.spawnOnce({
@@ -1665,8 +1889,10 @@ export default class DynamicAgentsExtension implements Extension {
                     return 'Error: no active task context found.';
                 }
                 const taskId = taskContext.data.id;
-                if (agentProfile.isSubagent) {
-                    return 'Error: a subagent cannot spawn dynamic agents.';
+                const callerDepth = this.getProfileDepth(agentProfile);
+                const maxDepth = this.getMaxSubagentDepth();
+                if (callerDepth >= maxDepth) {
+                    return `Error: maximum subagent depth (${maxDepth}) reached.`;
                 }
                 if (_signal?.aborted) {
                     return 'Error: operation aborted.';
@@ -1707,6 +1933,7 @@ export default class DynamicAgentsExtension implements Extension {
                     enabledServers: resolvedGoalServers ?? input.enabledServers,
                 };
 
+                const childDepth = callerDepth + 1;
                 let entry = session.get(name);
                 if (!entry) {
                     entry = {
@@ -1717,10 +1944,11 @@ export default class DynamicAgentsExtension implements Extension {
                 } else {
                     entry.profile = buildProfile(agentProfile, taskId, goalInputWithServers, name);
                 }
+                this.profileDepths.set(entry.profile.id, childDepth);
                 entry.calls += 1;
                 const goalEntry: DynamicEntry = entry;
 
-                const config = readExtensionConfig();
+                const config = readExtensionConfig(this.configPath);
                 const maxRounds = input.maxRounds ?? config.defaultGoalMaxRounds ?? 3;
                 const idleTimeoutSeconds =
                     input.idleTimeoutSeconds ?? config.defaultIdleTimeoutSeconds ?? 180;
@@ -1767,8 +1995,10 @@ export default class DynamicAgentsExtension implements Extension {
                     return 'Error: no active task context found.';
                 }
                 const taskId = taskContext.data.id;
-                if (agentProfile.isSubagent) {
-                    return 'Error: a subagent cannot spawn dynamic agents.';
+                const callerDepth = this.getProfileDepth(agentProfile);
+                const maxDepth = this.getMaxSubagentDepth();
+                if (callerDepth >= maxDepth) {
+                    return `Error: maximum subagent depth (${maxDepth}) reached.`;
                 }
                 if (_signal?.aborted) {
                     return 'Error: operation aborted.';
@@ -1785,7 +2015,7 @@ export default class DynamicAgentsExtension implements Extension {
                 const names = buildDebateAgentNames(counter);
 
                 const activeSession = session;
-                const config = readExtensionConfig();
+                const config = readExtensionConfig(this.configPath);
                 const rounds = input.rounds ?? config.defaultDebateRounds ?? 2;
                 const idleTimeoutSeconds =
                     input.idleTimeoutSeconds ?? config.defaultIdleTimeoutSeconds ?? 180;
@@ -1826,6 +2056,7 @@ export default class DynamicAgentsExtension implements Extension {
                             contextFiles: input.contextFiles,
                             idleTimeoutSeconds: input.idleTimeoutSeconds,
                         };
+                        const childDepth = callerDepth + 1;
                         let entry = activeSession.get(req.name);
                         if (!entry) {
                             entry = {
@@ -1841,6 +2072,7 @@ export default class DynamicAgentsExtension implements Extension {
                                 req.name,
                             );
                         }
+                        this.profileDepths.set(entry.profile.id, childDepth);
                         entry.calls += 1;
                         return this.spawnOnce({
                             execContext,
@@ -1907,10 +2139,12 @@ export default class DynamicAgentsExtension implements Extension {
     }): Promise<SpawnOutcome> {
         const { execContext, taskContext, baseProfile, prompt, name, contextFiles } = params;
         const { signal, idleTimeoutSeconds } = params;
+        const baseDepth = this.getProfileDepth(baseProfile);
         const runProfile: AgentProfile = {
             ...baseProfile,
             id: `${baseProfile.id}-${randomUUID().slice(0, 8)}`,
         };
+        this.profileDepths.set(runProfile.id, baseDepth);
         this.results.delete(runProfile.id);
 
         if (contextFiles && contextFiles.length > 0) {
@@ -2007,12 +2241,18 @@ export default class DynamicAgentsExtension implements Extension {
         if (session) {
             for (const entry of session.values()) {
                 this.results.delete(entry.profile.id);
+                this.profileDepths.delete(entry.profile.id);
             }
         }
         const prefix = `dynamic-agents-${taskId}-`;
         for (const key of Array.from(this.results.keys())) {
             if (key.startsWith(prefix)) {
                 this.results.delete(key);
+            }
+        }
+        for (const key of Array.from(this.profileDepths.keys())) {
+            if (key.startsWith(prefix)) {
+                this.profileDepths.delete(key);
             }
         }
         for (const [key, tracker] of Array.from(this.activeSubagents.entries())) {

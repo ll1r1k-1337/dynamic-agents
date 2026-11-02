@@ -21,6 +21,7 @@ import DynamicAgentsExtension, {
     formatGoalResult,
     goalInputSchema,
     listInputSchema,
+    parseCommandArgs,
     parseDebateVerdict,
     parseGoalVerdict,
     readExtensionConfig,
@@ -1345,6 +1346,7 @@ describe('Extension Settings & Configuration', () => {
         assert.equal(DEFAULT_CONFIG.defaultGoalMaxRounds, 3);
         assert.equal(DEFAULT_CONFIG.defaultDebateRounds, 2);
         assert.equal(DEFAULT_CONFIG.defaultIdleTimeoutSeconds, 180);
+        assert.equal(DEFAULT_CONFIG.maxSubagentDepth, 2);
     });
 
     it('reads and writes configuration to a custom path', () => {
@@ -1354,13 +1356,14 @@ describe('Extension Settings & Configuration', () => {
             assert.deepEqual(initial, DEFAULT_CONFIG);
 
             writeExtensionConfig(
-                { defaultGoalMaxRounds: 0, defaultDebateRounds: 0 },
+                { defaultGoalMaxRounds: 0, defaultDebateRounds: 0, maxSubagentDepth: 1 },
                 tempConfigPath,
             );
             const updated = readExtensionConfig(tempConfigPath);
             assert.equal(updated.defaultGoalMaxRounds, 0);
             assert.equal(updated.defaultDebateRounds, 0);
             assert.equal(updated.defaultIdleTimeoutSeconds, 180);
+            assert.equal(updated.maxSubagentDepth, 1);
         } finally {
             try {
                 fs.unlinkSync(tempConfigPath);
@@ -1599,6 +1602,373 @@ describe('resolveEnabledServers', () => {
         } finally {
             if (fs.existsSync(tempConfigPath)) {
                 fs.unlinkSync(tempConfigPath);
+            }
+        }
+    });
+});
+
+describe('parseCommandArgs', () => {
+    it('parses plain text arguments without flags', () => {
+        const parsed = parseCommandArgs(['make', 'tests', 'pass']);
+        assert.equal(parsed.text, 'make tests pass');
+        assert.equal(parsed.rounds, undefined);
+        assert.equal(parsed.preset, undefined);
+        assert.equal(parsed.timeoutSeconds, undefined);
+    });
+
+    it('strips outer single and double quotes', () => {
+        const parsed = parseCommandArgs(['"npm test passes"', "'extra text'"]);
+        assert.equal(parsed.text, 'npm test passes extra text');
+    });
+
+    it('parses short and long round flags', () => {
+        const p1 = parseCommandArgs(['-r', '5', 'fix', 'bug']);
+        assert.equal(p1.rounds, 5);
+        assert.equal(p1.text, 'fix bug');
+
+        const p2 = parseCommandArgs(['--rounds', '3', 'fix', 'bug']);
+        assert.equal(p2.rounds, 3);
+        assert.equal(p2.text, 'fix bug');
+
+        const p3 = parseCommandArgs(['--rounds=4', 'fix', 'bug']);
+        assert.equal(p3.rounds, 4);
+        assert.equal(p3.text, 'fix bug');
+    });
+
+    it('parses positional leading number as rounds', () => {
+        const parsed = parseCommandArgs(['5', 'npm', 'run', 'test']);
+        assert.equal(parsed.rounds, 5);
+        assert.equal(parsed.text, 'npm run test');
+    });
+
+    it('parses preset and timeout flags', () => {
+        const parsed = parseCommandArgs([
+            '-p',
+            'reviewer',
+            '-t',
+            '60',
+            '--rounds=2',
+            'review',
+            'code',
+        ]);
+        assert.equal(parsed.rounds, 2);
+        assert.equal(parsed.preset, 'reviewer');
+        assert.equal(parsed.timeoutSeconds, 60);
+        assert.equal(parsed.text, 'review code');
+    });
+
+    it('parses inline preset and timeout with equal sign', () => {
+        const parsed = parseCommandArgs(['--preset=architect', '--timeout=120', 'design', 'seams']);
+        assert.equal(parsed.preset, 'architect');
+        assert.equal(parsed.timeoutSeconds, 120);
+        assert.equal(parsed.text, 'design seams');
+    });
+
+    it('retains flags as text parts when followed by invalid or missing values', () => {
+        const parsed = parseCommandArgs(['mocha', '-r', 'ts-node', '-t', 'not-a-number', '-p']);
+        assert.equal(parsed.rounds, undefined);
+        assert.equal(parsed.timeoutSeconds, undefined);
+        assert.equal(parsed.preset, undefined);
+        assert.equal(parsed.text, 'mocha -r ts-node -t not-a-number -p');
+    });
+});
+
+describe('getCommands', () => {
+    it('registers goal and debate commands with correct metadata', () => {
+        const ext = new DynamicAgentsExtension();
+        const context = createMockContext();
+        const commands = ext.getCommands(context);
+        assert.equal(commands.length, 2);
+
+        const goalCmd = commands.find((c) => c.name === 'goal');
+        const debateCmd = commands.find((c) => c.name === 'debate');
+        assert.ok(goalCmd);
+        assert.ok(debateCmd);
+        assert.equal(goalCmd.arguments?.length, 1);
+        assert.equal(debateCmd.arguments?.length, 1);
+    });
+
+    it('logs warning when taskContext is missing', async () => {
+        const ext = new DynamicAgentsExtension();
+        let logMsg = '';
+        let logLevel = '';
+        const context = {
+            ...createMockContext(),
+            log: (msg: string, level: string) => {
+                logMsg = msg;
+                logLevel = level;
+            },
+            getTaskContext: () => null,
+        } as unknown as ExtensionContext;
+
+        const commands = ext.getCommands(context);
+        const goalCmd = commands.find((c) => c.name === 'goal');
+        assert.ok(goalCmd);
+
+        await goalCmd.execute(['npm', 'test'], context);
+        assert.ok(logMsg.includes('No active task context'));
+        assert.equal(logLevel, 'warn');
+    });
+
+    it('shows warning log message when goal command has no arguments', async () => {
+        const ext = new DynamicAgentsExtension();
+        let logType = '';
+        let logText = '';
+        let runPromptCalled = false;
+        const taskContext = {
+            addLogMessage: (level: string, message: string) => {
+                logType = level;
+                logText = message;
+            },
+            runPrompt: async () => {
+                runPromptCalled = true;
+            },
+        };
+        const context = {
+            ...createMockContext(),
+            getTaskContext: () => taskContext,
+        } as unknown as ExtensionContext;
+
+        const commands = ext.getCommands(context);
+        const goalCmd = commands.find((c) => c.name === 'goal');
+        assert.ok(goalCmd);
+
+        await goalCmd.execute([], context);
+        assert.equal(runPromptCalled, false);
+        assert.equal(logType, 'warning');
+        assert.ok(logText.includes('Usage: /goal'));
+    });
+
+    it('runs prompt in orchestrator mode when goal command has valid text', async () => {
+        const ext = new DynamicAgentsExtension();
+        let promptedText = '';
+        let promptedMode = '';
+        const taskContext = {
+            addLogMessage: () => {},
+            runPrompt: async (prompt: string, mode?: string) => {
+                promptedText = prompt;
+                promptedMode = mode ?? '';
+            },
+        };
+        const context = {
+            ...createMockContext(),
+            getTaskContext: () => taskContext,
+        } as unknown as ExtensionContext;
+
+        const commands = ext.getCommands(context);
+        const goalCmd = commands.find((c) => c.name === 'goal');
+        assert.ok(goalCmd);
+
+        await goalCmd.execute(['-r', '5', '-p', 'tester', 'run', 'all', 'tests'], context);
+        assert.equal(promptedMode, 'orchestrator');
+        assert.ok(
+            promptedText.includes('Achieve this verifiable goal using run_dynamic_agent_goal'),
+        );
+        assert.ok(promptedText.includes('maxRounds: 5'));
+        assert.ok(promptedText.includes('preset: tester'));
+        assert.ok(promptedText.includes('run all tests'));
+    });
+
+    it('shows warning log message when debate command has no arguments', async () => {
+        const ext = new DynamicAgentsExtension();
+        let logType = '';
+        let logText = '';
+        let runPromptCalled = false;
+        const taskContext = {
+            addLogMessage: (level: string, message: string) => {
+                logType = level;
+                logText = message;
+            },
+            runPrompt: async () => {
+                runPromptCalled = true;
+            },
+        };
+        const context = {
+            ...createMockContext(),
+            getTaskContext: () => taskContext,
+        } as unknown as ExtensionContext;
+
+        const commands = ext.getCommands(context);
+        const debateCmd = commands.find((c) => c.name === 'debate');
+        assert.ok(debateCmd);
+
+        await debateCmd.execute([], context);
+        assert.equal(runPromptCalled, false);
+        assert.equal(logType, 'warning');
+        assert.ok(logText.includes('Usage: /debate'));
+    });
+
+    it('runs prompt in orchestrator mode when debate command has valid topic', async () => {
+        const ext = new DynamicAgentsExtension();
+        let promptedText = '';
+        let promptedMode = '';
+        const taskContext = {
+            addLogMessage: () => {},
+            runPrompt: async (prompt: string, mode?: string) => {
+                promptedText = prompt;
+                promptedMode = mode ?? '';
+            },
+        };
+        const context = {
+            ...createMockContext(),
+            getTaskContext: () => taskContext,
+        } as unknown as ExtensionContext;
+
+        const commands = ext.getCommands(context);
+        const debateCmd = commands.find((c) => c.name === 'debate');
+        assert.ok(debateCmd);
+
+        await debateCmd.execute(['--rounds=3', 'Monorepo', 'vs', 'Polyrepo'], context);
+        assert.equal(promptedMode, 'orchestrator');
+        assert.ok(
+            promptedText.includes(
+                'Conduct a structured debate on this topic using run_agent_debate',
+            ),
+        );
+        assert.ok(promptedText.includes('rounds: 3'));
+        assert.ok(promptedText.includes('Monorepo vs Polyrepo'));
+    });
+
+    it('enforces maxSubagentDepth when subagents attempt to spawn dynamic agents', async () => {
+        const ext = new DynamicAgentsExtension();
+        const context = createMockContext();
+        const subagentProfile = {
+            ...createMockBaseProfile(),
+            id: 'dynamic-agents-task-depth-test-subagent-1',
+            isSubagent: true,
+        };
+
+        const tempConfigPath = `/tmp/test-depth-config-${Date.now()}.json`;
+        try {
+            // Case 1: maxSubagentDepth = 1 blocks any subagent (depth 1 >= 1)
+            writeExtensionConfig({ maxSubagentDepth: 1 }, tempConfigPath);
+            ext.configPath = tempConfigPath;
+
+            const tools = ext.getTools(context, 'default', subagentProfile);
+            const runTool = tools.find((t) => t.name === 'run_dynamic_agent');
+            assert.ok(runTool);
+
+            const execContext = {
+                ...context,
+                getTaskContext: () => ({
+                    data: { id: 'task-depth-test' },
+                }),
+            } as unknown as ExtensionContext;
+
+            const blockedResult = await runTool.execute(
+                { prompt: 'subtask', systemPrompt: 'subagent worker' },
+                undefined,
+                execContext,
+                {},
+            );
+            assert.equal(String(blockedResult), 'Error: maximum subagent depth (1) reached.');
+
+            // Case 2: maxSubagentDepth = 2 allows depth 1 subagent to spawn
+            writeExtensionConfig({ maxSubagentDepth: 2 }, tempConfigPath);
+
+            let subagentSpawnedWithProfileId = '';
+            const taskContext = {
+                data: { id: 'task-depth-test-2' },
+                runSubagent: async (profile: { id: string }) => {
+                    subagentSpawnedWithProfileId = profile.id;
+                    const event = {
+                        subagentProfile: profile,
+                        resultMessages: [
+                            { id: 'm1', role: 'assistant', content: 'done from child subagent' },
+                        ],
+                    };
+                    await ext.onSubagentFinished(event as never, context);
+                    return 'done from child subagent';
+                },
+                interruptResponse: async () => {},
+            };
+            const execContext2 = {
+                ...context,
+                getTaskContext: () => taskContext,
+            } as unknown as ExtensionContext;
+
+            const allowedResult = await runTool.execute(
+                { prompt: 'child task', systemPrompt: 'child worker', name: 'child-agent' },
+                undefined,
+                execContext2,
+                {},
+            );
+            assert.ok(String(allowedResult).includes('done from child subagent'));
+            assert.ok(subagentSpawnedWithProfileId.length > 0);
+
+            // Case 3: child subagent at depth 2 cannot spawn further when maxSubagentDepth = 2
+            const childProfile = {
+                ...createMockBaseProfile(),
+                id: subagentSpawnedWithProfileId,
+                isSubagent: true,
+            };
+            const childTools = ext.getTools(context, 'default', childProfile);
+            const childRunTool = childTools.find((t) => t.name === 'run_dynamic_agent');
+            assert.ok(childRunTool);
+
+            const grandchildResult = await childRunTool.execute(
+                { prompt: 'grandchild task', systemPrompt: 'grandchild worker' },
+                undefined,
+                execContext2,
+                {},
+            );
+            assert.equal(String(grandchildResult), 'Error: maximum subagent depth (2) reached.');
+        } finally {
+            try {
+                fs.unlinkSync(tempConfigPath);
+            } catch {
+                // Ignore
+            }
+        }
+    });
+
+    it('enforces maxSubagentDepth for goal and debate tools', async () => {
+        const ext = new DynamicAgentsExtension();
+        const context = createMockContext();
+        const subagentProfile = {
+            ...createMockBaseProfile(),
+            id: 'subagent-caller',
+            isSubagent: true,
+        };
+
+        const tempConfigPath = `/tmp/test-depth-tools-${Date.now()}.json`;
+        try {
+            writeExtensionConfig({ maxSubagentDepth: 1 }, tempConfigPath);
+            ext.configPath = tempConfigPath;
+
+            const tools = ext.getTools(context, 'default', subagentProfile);
+            const goalTool = tools.find((t) => t.name === 'run_dynamic_agent_goal');
+            const debateTool = tools.find((t) => t.name === 'run_agent_debate');
+            assert.ok(goalTool);
+            assert.ok(debateTool);
+
+            const execContext = {
+                ...context,
+                getTaskContext: () => ({
+                    data: { id: 'task-depth-tools' },
+                }),
+            } as unknown as ExtensionContext;
+
+            const goalRes = await goalTool.execute(
+                { goal: 'sub goal' },
+                undefined,
+                execContext,
+                {},
+            );
+            assert.equal(goalRes, 'Error: maximum subagent depth (1) reached.');
+
+            const debateRes = await debateTool.execute(
+                { topic: 'sub topic' },
+                undefined,
+                execContext,
+                {},
+            );
+            assert.equal(debateRes, 'Error: maximum subagent depth (1) reached.');
+        } finally {
+            try {
+                fs.unlinkSync(tempConfigPath);
+            } catch {
+                // Ignore
             }
         }
     });

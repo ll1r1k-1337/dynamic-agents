@@ -134,8 +134,48 @@ Configure global defaults in the AiderDesk extension settings dialog:
 - **defaultGoalMaxRounds**: default max rounds for goal loops (default: 3). Set to `0` for unlimited rounds.
 - **defaultDebateRounds**: default rebuttal pairs for debates (default: 2). Set to `0` for continuous debate until consensus.
 - **defaultIdleTimeoutSeconds**: default inactivity timeout per subagent turn in seconds (default: 180). Set to `0` to disable.
+- **maxSubagentDepth**: maximum nesting level for dynamic subagents (default: 2). Set to 1 for flat subagents only, or 2+ to allow subagents to spawn child subagents (e.g. inside goal loops).
 
 These settings are stored in `config.json` inside the extension folder and can be configured through the AiderDesk UI.
+
+---
+
+## Commands
+
+### /goal
+
+Run an iterative goal loop toward a verifiable end state using dynamic subagents.
+
+```text
+/goal [-r <rounds>] [-p <preset>] [-t <timeout>] <verifiable goal>
+```
+
+Options:
+- `-r`, `--rounds <number>`: Maximum number of agent rounds (e.g. `-r 5`).
+- `-p`, `--preset <name>`: Agent preset (`reviewer`, `tester`, `architect`, `refactorer`, `researcher`).
+- `-t`, `--timeout <seconds>`: Inactivity timeout per turn in seconds.
+
+Examples:
+- `/goal npm test passes`
+- `/goal -r 5 npm run typecheck is clean`
+- `/goal -r 3 -p tester fix failing unit tests in test/auth.test.ts`
+
+### /debate
+
+Run a structured debate between advocate and critic agents on a contested topic, followed by neutral synthesis.
+
+```text
+/debate [-r <rounds>] [-p <preset>] [-t <timeout>] <topic or decision>
+```
+
+Options:
+- `-r`, `--rounds <number>`: Number of rebuttal pairs between advocate and critic (e.g. `-r 2`).
+- `-p`, `--preset <name>`: Synthesizer and debate archetype preset.
+- `-t`, `--timeout <seconds>`: Inactivity timeout per turn in seconds.
+
+Examples:
+- `/debate Monorepo vs Polyrepo for multi-package architecture`
+- `/debate -r 3 REST vs GraphQL for mobile clients`
 
 ---
 
