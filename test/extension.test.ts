@@ -2,10 +2,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { describe, it } from 'node:test';
 import type { AgentProfile, ContextMessage, ExtensionContext } from '@aiderdesk/extensions';
-import { ContextMemoryMode, InvocationMode } from '@aiderdesk/extensions';
+import { ContextMemoryMode, InvocationMode, ToolApprovalState } from '@aiderdesk/extensions';
 import type { RoundRequest, SpawnOutcome } from '../index.ts';
 import DynamicAgentsExtension, {
-    AGENT_PRESETS,
     buildDebateAgentNames,
     buildDebateRoundPrompt,
     buildDebateTranscript,
@@ -186,6 +185,51 @@ describe('buildProfile', () => {
         assert.equal(profile.systemPrompt, 'You are subagent worker.');
     });
 
+    it('gives delegated agents file and shell access even when the parent is the orchestrator', () => {
+        const ext = new DynamicAgentsExtension();
+        const context = createMockContext();
+        const orchestrator = ext.getAgents(context)[0];
+        assert.ok(orchestrator);
+
+        const profile = buildProfile(
+            orchestrator,
+            'task-orch',
+            {
+                prompt: 'Run task',
+                systemPrompt: 'You are subagent worker.',
+                name: 'worker-orch',
+            },
+            'worker-orch',
+        );
+
+        assert.equal(profile.usePowerTools, true);
+        assert.equal(profile.useAiderTools, true);
+        assert.deepEqual(profile.toolApprovals, {});
+    });
+
+    it('honors explicit tool overrides from the orchestrator', () => {
+        const ext = new DynamicAgentsExtension();
+        const context = createMockContext();
+        const orchestrator = ext.getAgents(context)[0];
+        assert.ok(orchestrator);
+
+        const profile = buildProfile(
+            orchestrator,
+            'task-orch-2',
+            {
+                prompt: 'Run task',
+                systemPrompt: 'You are subagent worker.',
+                name: 'worker-orch-2',
+                usePowerTools: false,
+                useAiderTools: false,
+            },
+            'worker-orch-2',
+        );
+
+        assert.equal(profile.usePowerTools, false);
+        assert.equal(profile.useAiderTools, false);
+    });
+
     it('overrides provider and model when provided', () => {
         const base = createMockBaseProfile();
         const profile = buildProfile(
@@ -205,48 +249,29 @@ describe('buildProfile', () => {
         assert.equal(profile.model, 'gpt-4o');
     });
 
-    it('prepends preset instructions when preset is provided', () => {
+    it('configures custom capabilities directly on subagent profile', () => {
         const base = createMockBaseProfile();
         const profile = buildProfile(
             base,
-            'task-preset',
+            'task-custom-caps',
             {
                 prompt: 'Review PR',
                 systemPrompt: 'Follow company standards.',
                 name: 'reviewer-subagent',
-                preset: 'reviewer',
+                includeRepoMap: false,
+                disabledExtensionTools: ['seek', 'learn'],
+                toolApprovals: {
+                    'power---file_write': ToolApprovalState.Never,
+                },
                 useTodoTools: true,
             },
             'reviewer-subagent',
         );
 
-        assert.ok(profile.systemPrompt?.includes(AGENT_PRESETS.reviewer));
+        assert.equal(profile.includeRepoMap, false);
+        assert.deepEqual(profile.disabledExtensionTools, ['seek', 'learn']);
+        assert.equal(profile.toolApprovals['power---file_write'], ToolApprovalState.Never);
         assert.ok(profile.systemPrompt?.includes('Follow company standards.'));
-    });
-
-    it('prepends preset instructions for all supported presets', () => {
-        const base = createMockBaseProfile();
-        const presets: Array<keyof typeof AGENT_PRESETS> = [
-            'reviewer',
-            'tester',
-            'architect',
-            'refactorer',
-            'researcher',
-        ];
-        for (const preset of presets) {
-            const profile = buildProfile(
-                base,
-                'task-preset',
-                {
-                    prompt: 'Do work',
-                    systemPrompt: 'My custom instruction',
-                    preset,
-                },
-                `${preset}-agent`,
-            );
-            assert.ok(profile.systemPrompt?.includes(AGENT_PRESETS[preset]));
-            assert.ok(profile.systemPrompt?.includes('My custom instruction'));
-        }
     });
 
     it('passes input.maxTokens to the profile', () => {
@@ -325,25 +350,19 @@ describe('runInputSchema and listInputSchema', () => {
         });
     });
 
-    it('validates preset and contextFiles in schema', () => {
+    it('validates toolApprovals and contextFiles in schema', () => {
         const parsed = runInputSchema.parse({
             prompt: 'Test prompt',
             systemPrompt: 'Test role',
-            preset: 'tester',
+            toolApprovals: {
+                'power---file_write': ToolApprovalState.Always,
+                'power---bash': ToolApprovalState.Never,
+            },
             contextFiles: ['src/app.ts', 'src/types.ts'],
         });
-        assert.equal(parsed.preset, 'tester');
+        assert.equal(parsed.toolApprovals?.['power---file_write'], ToolApprovalState.Always);
+        assert.equal(parsed.toolApprovals?.['power---bash'], ToolApprovalState.Never);
         assert.deepEqual(parsed.contextFiles, ['src/app.ts', 'src/types.ts']);
-    });
-
-    it('rejects unknown preset values', () => {
-        assert.throws(() => {
-            runInputSchema.parse({
-                prompt: 'Test prompt',
-                systemPrompt: 'Test role',
-                preset: 'invalid-preset' as unknown as 'reviewer',
-            });
-        });
     });
 
     it('validates maxTokens bounds in schema', () => {
@@ -376,26 +395,29 @@ describe('runInputSchema and listInputSchema', () => {
 });
 
 describe('DynamicAgentsExtension', () => {
-    it('registers orchestrator mode and agent', () => {
+    it('registers orchestrator agent and no modes', () => {
         const ext = new DynamicAgentsExtension();
         const context = createMockContext();
 
-        const modes = ext.getModes(context);
-        assert.equal(modes.length, 1);
-        assert.equal(modes[0]?.name, 'orchestrator');
+        assert.equal('getModes' in ext, false);
 
         const agents = ext.getAgents(context);
         assert.equal(agents.length, 1);
         assert.equal(agents[0]?.id, 'dynamic-agents-orchestrator');
         assert.equal(agents[0]?.maxTokens, 16384);
+        assert.equal(agents[0]?.usePowerTools, false);
+        assert.equal(agents[0]?.useAiderTools, false);
+        assert.equal(agents[0]?.useTodoTools, true);
+        assert.equal(agents[0]?.useExtensionTools, true);
+        assert.match(agents[0]?.systemPrompt ?? '', /strictly forbidden from reading files/);
     });
 
-    it('provides all tools in orchestrator mode', () => {
+    it('provides all tools', () => {
         const ext = new DynamicAgentsExtension();
         const context = createMockContext();
         const base = createMockBaseProfile();
 
-        const tools = ext.getTools(context, 'orchestrator', base);
+        const tools = ext.getTools(context, 'code', base);
         assert.equal(tools.length, 4);
 
         const names = tools.map((t) => t.name);
@@ -506,18 +528,12 @@ describe('DynamicAgentsExtension', () => {
         assert.equal(reset2Called, false);
     });
 
-    it('does not duplicate orchestrator messages if already present in contextMessages', async () => {
+    it('returns undefined in onAgentStarted for non-orchestrator agent profile', async () => {
         const ext = new DynamicAgentsExtension();
         const context = createMockContext();
         const event = {
-            mode: 'orchestrator',
-            contextMessages: [
-                {
-                    id: 'dynamic-agents-orchestrator-user',
-                    role: 'user',
-                    content: 'test',
-                },
-            ],
+            agentProfile: { id: 'other-agent', enabledServers: [] },
+            contextMessages: [],
         };
         const result = await ext.onAgentStarted(event as never, context);
         assert.equal(result, undefined);
@@ -603,7 +619,7 @@ describe('DynamicAgentsExtension', () => {
         const ext = new DynamicAgentsExtension();
         const context = createMockContext();
         const base = createMockBaseProfile();
-        const tools = ext.getTools(context, 'orchestrator', base);
+        const tools = ext.getTools(context, 'code', base);
         const runTool = tools.find((t) => t.name === 'run_dynamic_agent');
         assert.ok(runTool);
 
@@ -630,7 +646,7 @@ describe('DynamicAgentsExtension', () => {
         const ext = new DynamicAgentsExtension();
         const context = createMockContext();
         const base = createMockBaseProfile();
-        const tools = ext.getTools(context, 'orchestrator', base);
+        const tools = ext.getTools(context, 'code', base);
         const goalTool = tools.find((t) => t.name === 'run_dynamic_agent_goal');
         const debateTool = tools.find((t) => t.name === 'run_agent_debate');
         assert.ok(goalTool);
@@ -667,7 +683,7 @@ describe('DynamicAgentsExtension', () => {
         const ext = new DynamicAgentsExtension();
         const context = createMockContext();
         const base = createMockBaseProfile();
-        const tools = ext.getTools(context, 'orchestrator', base);
+        const tools = ext.getTools(context, 'code', base);
         const listTool = tools.find((t) => t.name === 'list_dynamic_subagents');
         assert.ok(listTool);
 
@@ -1612,7 +1628,6 @@ describe('parseCommandArgs', () => {
         const parsed = parseCommandArgs(['make', 'tests', 'pass']);
         assert.equal(parsed.text, 'make tests pass');
         assert.equal(parsed.rounds, undefined);
-        assert.equal(parsed.preset, undefined);
         assert.equal(parsed.timeoutSeconds, undefined);
     });
 
@@ -1641,10 +1656,8 @@ describe('parseCommandArgs', () => {
         assert.equal(parsed.text, 'npm run test');
     });
 
-    it('parses preset and timeout flags', () => {
+    it('parses timeout flags', () => {
         const parsed = parseCommandArgs([
-            '-p',
-            'reviewer',
             '-t',
             '60',
             '--rounds=2',
@@ -1652,24 +1665,21 @@ describe('parseCommandArgs', () => {
             'code',
         ]);
         assert.equal(parsed.rounds, 2);
-        assert.equal(parsed.preset, 'reviewer');
         assert.equal(parsed.timeoutSeconds, 60);
         assert.equal(parsed.text, 'review code');
     });
 
-    it('parses inline preset and timeout with equal sign', () => {
-        const parsed = parseCommandArgs(['--preset=architect', '--timeout=120', 'design', 'seams']);
-        assert.equal(parsed.preset, 'architect');
+    it('parses inline timeout with equal sign', () => {
+        const parsed = parseCommandArgs(['--timeout=120', 'design', 'seams']);
         assert.equal(parsed.timeoutSeconds, 120);
         assert.equal(parsed.text, 'design seams');
     });
 
     it('retains flags as text parts when followed by invalid or missing values', () => {
-        const parsed = parseCommandArgs(['mocha', '-r', 'ts-node', '-t', 'not-a-number', '-p']);
+        const parsed = parseCommandArgs(['mocha', '-r', 'ts-node', '-t', 'not-a-number']);
         assert.equal(parsed.rounds, undefined);
         assert.equal(parsed.timeoutSeconds, undefined);
-        assert.equal(parsed.preset, undefined);
-        assert.equal(parsed.text, 'mocha -r ts-node -t not-a-number -p');
+        assert.equal(parsed.text, 'mocha -r ts-node -t not-a-number');
     });
 });
 
@@ -1739,15 +1749,15 @@ describe('getCommands', () => {
         assert.ok(logText.includes('Usage: /goal'));
     });
 
-    it('runs prompt in orchestrator mode when goal command has valid text', async () => {
+    it('runs prompt when goal command has valid text', async () => {
         const ext = new DynamicAgentsExtension();
         let promptedText = '';
-        let promptedMode = '';
+        let promptedMode: string | undefined = 'default';
         const taskContext = {
             addLogMessage: () => {},
             runPrompt: async (prompt: string, mode?: string) => {
                 promptedText = prompt;
-                promptedMode = mode ?? '';
+                promptedMode = mode;
             },
         };
         const context = {
@@ -1759,13 +1769,13 @@ describe('getCommands', () => {
         const goalCmd = commands.find((c) => c.name === 'goal');
         assert.ok(goalCmd);
 
-        await goalCmd.execute(['-r', '5', '-p', 'tester', 'run', 'all', 'tests'], context);
-        assert.equal(promptedMode, 'orchestrator');
+        await goalCmd.execute(['-r', '5', '-t', '60', 'run', 'all', 'tests'], context);
+        assert.equal(promptedMode, undefined);
         assert.ok(
             promptedText.includes('Achieve this verifiable goal using run_dynamic_agent_goal'),
         );
         assert.ok(promptedText.includes('maxRounds: 5'));
-        assert.ok(promptedText.includes('preset: tester'));
+        assert.ok(promptedText.includes('idleTimeoutSeconds: 60'));
         assert.ok(promptedText.includes('run all tests'));
     });
 
@@ -1798,15 +1808,15 @@ describe('getCommands', () => {
         assert.ok(logText.includes('Usage: /debate'));
     });
 
-    it('runs prompt in orchestrator mode when debate command has valid topic', async () => {
+    it('runs prompt when debate command has valid topic', async () => {
         const ext = new DynamicAgentsExtension();
         let promptedText = '';
-        let promptedMode = '';
+        let promptedMode: string | undefined = 'default';
         const taskContext = {
             addLogMessage: () => {},
             runPrompt: async (prompt: string, mode?: string) => {
                 promptedText = prompt;
-                promptedMode = mode ?? '';
+                promptedMode = mode;
             },
         };
         const context = {
@@ -1819,7 +1829,7 @@ describe('getCommands', () => {
         assert.ok(debateCmd);
 
         await debateCmd.execute(['--rounds=3', 'Monorepo', 'vs', 'Polyrepo'], context);
-        assert.equal(promptedMode, 'orchestrator');
+        assert.equal(promptedMode, undefined);
         assert.ok(
             promptedText.includes(
                 'Conduct a structured debate on this topic using run_agent_debate',
@@ -1971,5 +1981,113 @@ describe('getCommands', () => {
                 // Ignore
             }
         }
+    });
+});
+
+describe('orchestrator allowlist and direct capability configuration', () => {
+    it('exposes only delegation tools to the orchestrator', () => {
+        const ext = new DynamicAgentsExtension();
+        const orchestratorProfile = {
+            ...createMockBaseProfile(),
+            id: 'dynamic-agents-orchestrator',
+        };
+        const tools = ext.getTools(createMockContext(), 'default', orchestratorProfile);
+        assert.deepEqual(
+            tools.map((tool) => tool.name).sort(),
+            [
+                'list_dynamic_subagents',
+                'run_agent_debate',
+                'run_dynamic_agent',
+                'run_dynamic_agent_goal',
+            ],
+        );
+    });
+
+    it('keeps extension and MCP tools unreachable for the orchestrator', () => {
+        const ext = new DynamicAgentsExtension();
+        const orchestratorProfile = {
+            ...createMockBaseProfile(),
+            id: 'dynamic-agents-orchestrator',
+        };
+        const names = ext
+            .getTools(createMockContext(), 'default', orchestratorProfile)
+            .map((tool) => tool.name);
+        for (const forbidden of [
+            'codegraph-explore',
+            'codegraph---codegraph-explore',
+            'lsp-find-references',
+            'seek',
+            'learn',
+            'power---bash',
+            'omniroute-http---local_corpus_status',
+        ]) {
+            assert.ok(!names.includes(forbidden));
+        }
+    });
+
+    it('configures coder-role subagent with repo map, code extensions, and power tools', () => {
+        const profile = buildProfile(
+            createMockBaseProfile(),
+            'task-coder',
+            {
+                prompt: 'Fix the bug',
+                systemPrompt: 'Minimal diff.',
+                includeRepoMap: true,
+                usePowerTools: true,
+                useAiderTools: true,
+                disabledExtensionTools: [],
+            },
+            'coder-agent',
+        );
+        assert.equal(profile.includeRepoMap, true);
+        assert.equal(profile.usePowerTools, true);
+        assert.equal(profile.useAiderTools, true);
+        assert.deepEqual(profile.disabledExtensionTools, []);
+    });
+
+    it('configures researcher-role subagent with narrowed servers and report writing only', () => {
+        const profile = buildProfile(
+            createMockBaseProfile(),
+            'task-researcher',
+            {
+                prompt: 'Write the report',
+                systemPrompt: 'Cite files.',
+                enabledServers: ['omniroute-http'],
+                includeRepoMap: false,
+                useAiderTools: false,
+                disabledExtensionTools: ['codegraph', 'lsp'],
+                toolApprovals: {
+                    'power---file_write': ToolApprovalState.Always,
+                    'power---bash': ToolApprovalState.Never,
+                },
+            },
+            'researcher-agent',
+        );
+        assert.deepEqual(profile.enabledServers, ['omniroute-http']);
+        assert.equal(profile.includeRepoMap, false);
+        assert.equal(profile.useAiderTools, false);
+        assert.ok(profile.disabledExtensionTools?.includes('codegraph'));
+        assert.ok(profile.disabledExtensionTools?.includes('lsp'));
+        assert.equal(profile.toolApprovals['power---file_write'], ToolApprovalState.Always);
+        assert.equal(profile.toolApprovals['power---bash'], ToolApprovalState.Never);
+    });
+
+    it('accepts the capability fields in the run schema', () => {
+        const parsed = runInputSchema.parse({
+            prompt: 'p',
+            systemPrompt: 's',
+            includeRepoMap: true,
+            useExtensionTools: false,
+            disabledExtensionTools: ['lsp'],
+            useMemoryTools: true,
+            toolApprovals: {
+                'power---file_write': ToolApprovalState.Always,
+            },
+        });
+        assert.equal(parsed.includeRepoMap, true);
+        assert.equal(parsed.useExtensionTools, false);
+        assert.deepEqual(parsed.disabledExtensionTools, ['lsp']);
+        assert.equal(parsed.useMemoryTools, true);
+        assert.equal(parsed.toolApprovals?.['power---file_write'], ToolApprovalState.Always);
     });
 });

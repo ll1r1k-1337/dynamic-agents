@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
     AgentProfile,
@@ -12,7 +12,6 @@ import type {
     ContextMessage,
     Extension,
     ExtensionContext,
-    ModeDefinition,
     ProjectStoppedEvent,
     ResponseChunkEvent,
     SubagentFinishedEvent,
@@ -24,7 +23,7 @@ import type {
     ToolFinishedEvent,
 } from '@aiderdesk/extensions';
 
-import { ContextMemoryMode, InvocationMode } from '@aiderdesk/extensions';
+import { ContextMemoryMode, InvocationMode, ToolApprovalState } from '@aiderdesk/extensions';
 import { z } from 'zod';
 
 export interface ExtensionConfig {
@@ -117,19 +116,33 @@ export const writeExtensionConfig = (
     return merged;
 };
 
-const ORCHESTRATOR_USER_MESSAGE = `You are in orchestrator mode. Your primary tools are run_dynamic_agent and run_dynamic_agent_goal.
+export const ORCHESTRATOR_DESCRIPTION = [
+    'Orchestrator: a manager that only directs, coordinates, and delegates.',
+    'It never reads files, writes files, or executes shell commands itself.',
+    'All work runs in dynamic subagents via run_dynamic_agent, run_dynamic_agent_goal, and run_agent_debate.',
+].join(' ');
+
+const ORCHESTRATOR_USER_MESSAGE = `You are an orchestrator. You manage, coordinate, and delegate work. You do not perform work.
+
+${ORCHESTRATOR_DESCRIPTION}
+
+Hard rules:
+- You are strictly forbidden from reading files, writing files, and executing shell commands. You have no such tools.
+- You must not inspect the repository, run commands, or produce code changes directly.
+- You must not answer the user's task from your own knowledge when the task needs file or command access.
+- You must explicitly configure capabilities for each subagent based on its task:
+  * For coding tasks: configure includeRepoMap: true, usePowerTools: true, useAiderTools: true, and disabledExtensionTools: [] so the agent has full code context and analysis tools.
+  * For research tasks: configure enabledServers (e.g. ['omniroute-http']), includeRepoMap: false, disabledExtensionTools: ['codegraph', 'lsp'], and restrict toolApprovals (e.g. only file write).
 
 Work in these steps:
 1. Decompose the user's task into small, focused subtasks. Each subtask must have a clear scope and a verifiable outcome.
-2. Delegate each subtask to run_dynamic_agent with an inline profile: a short name, a role description, and a precise task prompt that includes all needed context (file paths, constraints, expected output).
+2. Delegate each subtask to run_dynamic_agent with an inline profile: a short name, explicit tool and capability configuration, a role description, and a precise task prompt that includes all needed context (file paths, constraints, expected output).
 3. Use run_dynamic_agent_goal instead of run_dynamic_agent when a subtask has a verifiable end state (tests pass, typecheck clean, file exists) and may need several iterations to converge. The tool returns a first line GOAL_RESULT: <status>; treat 'incomplete' or 'blocked' as a signal to refine the goal or fall back to run_dynamic_agent.
 4. Use run_agent_debate when a decision is contested and orthogonal critique helps: an advocate and a critic open with independent positions, rebut each other in pairs, and a synthesizer merges the strongest points. The tool returns a first line DEBATE_RESULT: <status>; treat 'blocked' as a signal to fall back to run_dynamic_agent.
 5. Run independent subtasks in parallel when possible.
-6. Verify each returned result against the subtask outcome. Re-run a subtask with a refined prompt when the result is incomplete or wrong.
-7. Do not implement subtasks yourself. Do the work yourself only when delegation is impossible or failed twice.
+6. Verify each returned result against the subtask outcome. Re-run a subtask with a refined prompt when the result is incomplete or wrong. Never fix the result yourself: delegate the fix.
+7. When delegation is impossible or fails twice, report the limitation to the user instead of doing the work yourself.
 8. Aggregate the verified results and give the user a final summary: what was done, which files changed, and any open issues.`;
-
-const ORCHESTRATOR_ASSISTANT_MESSAGE = `OK, I will decompose the task, delegate subtasks to dynamic agents, run goal loops when a subtask has a verifiable end state, run debates when a decision is contested, and aggregate their results.`;
 
 export const textFromContent = (content: unknown): string => {
     if (typeof content === 'string') {
@@ -179,30 +192,14 @@ export const extractResultText = (messages: readonly ContextMessage[]): string =
     return '';
 };
 
-export const AGENT_PRESETS = {
-    reviewer:
-        'You are an expert code reviewer. Analyze code thoroughly, assess security vulnerabilities, detect defects, and enforce quality standards.',
-    tester: 'You are a testing specialist. Develop comprehensive tests, verify edge conditions, and execute test suites.',
-    architect:
-        'You are a software architect. Design systems, define clean interfaces, and organize modular structures.',
-    refactorer:
-        'You are a refactoring specialist. Simplify code, eliminate duplication, and improve readability without altering behavior.',
-    researcher:
-        'You are a codebase researcher. Investigate the codebase, map connections, and produce rigorous architectural analysis.',
-} as const;
-
-export type AgentPreset = keyof typeof AGENT_PRESETS;
-
 export interface ParsedCommandArgs {
     rounds?: number;
-    preset?: string;
     timeoutSeconds?: number;
     text: string;
 }
 
 export const parseCommandArgs = (args: string[]): ParsedCommandArgs => {
     let rounds: number | undefined;
-    let preset: string | undefined;
     let timeoutSeconds: number | undefined;
     const textParts: string[] = [];
 
@@ -239,16 +236,6 @@ export const parseCommandArgs = (args: string[]): ParsedCommandArgs => {
             } else {
                 textParts.push(arg);
             }
-        } else if (arg === '-p' || arg === '--preset') {
-            const next = args[i + 1];
-            if (next !== undefined) {
-                preset = stripQuotes(next);
-                i++;
-            } else {
-                textParts.push(arg);
-            }
-        } else if (arg.startsWith('--preset=')) {
-            preset = stripQuotes(arg.slice('--preset='.length));
         } else if (arg === '-t' || arg === '--timeout') {
             const next = args[i + 1];
             if (next !== undefined && /^\d+$/.test(stripQuotes(next))) {
@@ -273,25 +260,47 @@ export const parseCommandArgs = (args: string[]): ParsedCommandArgs => {
 
     return {
         rounds,
-        preset,
         timeoutSeconds,
         text: textParts.join(' ').trim(),
     };
 };
 
-const ORCHESTRATOR_DESCRIPTION = [
-    'ORCHESTRATOR MODE. You are an orchestrator. Do NOT solve the task yourself.',
-    'Instead:',
-    '1. Decompose the user task into small, independent subtasks.',
-    '2. Call run_dynamic_agent once per subtask with a complete, self-contained prompt.',
-    '3. After all subtasks finish, synthesize the results into a final answer.',
-    'Rules:',
-    '- Each subtask prompt must be fully self-contained (no references to other subtask results unless you pass them explicitly).',
-    '- Prefer parallel execution: call multiple run_dynamic_agent tools in the same turn when subtasks are independent.',
-    '- Use run_dynamic_agent_goal instead of run_dynamic_agent when a subtask has a verifiable end state (tests pass, typecheck clean, file exists) and may need several iterations.',
-    '- Use run_agent_debate when a decision is contested and orthogonal critique before synthesis beats one opinion.',
-    '- Do not write code or answer questions yourself — delegate everything to dynamic agents.',
-].join('\n');
+// The orchestrator reaches no tool except delegation. AiderDesk gates extension tools per
+// profile by extension id, so every installed extension is disabled here. The list is rebuilt
+// on load, so a newly installed extension stays invisible without a code change.
+const SELF_EXTENSION_ID = basename(__dirname);
+
+const collectOtherExtensionIds = (): string[] => {
+    const root = join(__dirname, '..');
+    try {
+        return readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+            if (!entry.isDirectory() || entry.name === SELF_EXTENSION_ID) {
+                return [];
+            }
+            const ids = [entry.name];
+            try {
+                const manifest = JSON.parse(
+                    readFileSync(join(root, entry.name, 'package.json'), 'utf-8'),
+                ) as { name?: string };
+                if (manifest.name && manifest.name !== entry.name && manifest.name !== 'aider-desk') {
+                    ids.push(manifest.name);
+                }
+            } catch {
+                // No readable manifest: the folder name is the extension id.
+            }
+            return ids;
+        });
+    } catch {
+        return [];
+    }
+};
+
+const ORCHESTRATOR_ALLOWED_TOOL_NAMES = new Set<string>([
+    'run_dynamic_agent',
+    'run_dynamic_agent_goal',
+    'run_agent_debate',
+    'list_dynamic_subagents',
+]);
 
 const ORCHESTRATOR_AGENT_PROFILE: AgentProfile = {
     id: 'dynamic-agents-orchestrator',
@@ -305,16 +314,16 @@ const ORCHESTRATOR_AGENT_PROFILE: AgentProfile = {
     enabledServers: [],
     toolApprovals: {},
     toolSettings: {},
-    disabledExtensionTools: [],
+    disabledExtensionTools: collectOtherExtensionIds(),
     includeContextFiles: false,
     includeRepoMap: false,
-    usePowerTools: true,
+    usePowerTools: false,
     useAiderTools: false,
     useTodoTools: true,
     useSubagents: false,
     useTaskTools: false,
     useMemoryTools: false,
-    useSkillsTools: true,
+    useSkillsTools: false,
     useExtensionTools: true,
     customInstructions: '',
     subagent: {
@@ -382,6 +391,26 @@ export const runInputSchema = z.object({
         .boolean()
         .optional()
         .describe('Override the parent useMemoryTools for this agent.'),
+    includeRepoMap: z
+        .boolean()
+        .optional()
+        .describe('Override the parent includeRepoMap for this agent.'),
+    useExtensionTools: z
+        .boolean()
+        .optional()
+        .describe('Override the parent useExtensionTools for this agent.'),
+    disabledExtensionTools: z
+        .array(z.string())
+        .optional()
+        .describe(
+            'Extension ids to disable for this agent, for example codegraph or lsp. Defaults to the parent list.',
+        ),
+    toolApprovals: z
+        .record(z.string(), z.nativeEnum(ToolApprovalState))
+        .optional()
+        .describe(
+            'Explicit tool approvals map for this agent, e.g. {"power---file_write": "always", "power---bash": "never"}.',
+        ),
     idleTimeoutSeconds: z
         .number()
         .int()
@@ -390,10 +419,6 @@ export const runInputSchema = z.object({
         .describe(
             'Maximum seconds of inactivity before interrupting the subagent. Defaults to 180 seconds. Set to 0 to disable.',
         ),
-    preset: z
-        .enum(['reviewer', 'tester', 'architect', 'refactorer', 'researcher'])
-        .optional()
-        .describe('Preset archetype for specialized system instructions and role.'),
     contextFiles: z
         .array(z.string())
         .optional()
@@ -1165,6 +1190,22 @@ export const debateInputSchema = z.object({
         .boolean()
         .optional()
         .describe('Override the parent useMemoryTools for debate agents.'),
+    includeRepoMap: z
+        .boolean()
+        .optional()
+        .describe('Override the parent includeRepoMap for debate agents.'),
+    useExtensionTools: z
+        .boolean()
+        .optional()
+        .describe('Override the parent useExtensionTools for debate agents.'),
+    disabledExtensionTools: z
+        .array(z.string())
+        .optional()
+        .describe('Extension ids to disable for debate agents.'),
+    toolApprovals: z
+        .record(z.string(), z.nativeEnum(ToolApprovalState))
+        .optional()
+        .describe('Explicit tool approvals map for debate agents.'),
     contextFiles: z
         .array(z.string())
         .optional()
@@ -1177,10 +1218,6 @@ export const debateInputSchema = z.object({
         .describe(
             'Maximum seconds of inactivity before interrupting an agent turn. Applies to each round separately. Defaults to 180 seconds. Set to 0 to disable.',
         ),
-    preset: z
-        .enum(['reviewer', 'tester', 'architect', 'refactorer', 'researcher'])
-        .optional()
-        .describe('Preset archetype for specialized system instructions and role.'),
 });
 
 export const goalInputSchema = z.object({
@@ -1244,6 +1281,22 @@ export const goalInputSchema = z.object({
         .boolean()
         .optional()
         .describe('Override the parent useMemoryTools for this agent.'),
+    includeRepoMap: z
+        .boolean()
+        .optional()
+        .describe('Override the parent includeRepoMap for this agent.'),
+    useExtensionTools: z
+        .boolean()
+        .optional()
+        .describe('Override the parent useExtensionTools for this agent.'),
+    disabledExtensionTools: z
+        .array(z.string())
+        .optional()
+        .describe('Extension ids to disable for this agent.'),
+    toolApprovals: z
+        .record(z.string(), z.nativeEnum(ToolApprovalState))
+        .optional()
+        .describe('Explicit tool approvals map for this agent.'),
     contextFiles: z
         .array(z.string())
         .optional()
@@ -1256,10 +1309,6 @@ export const goalInputSchema = z.object({
         .describe(
             'Maximum seconds of inactivity before interrupting a goal round. Applies to each round separately. Defaults to 180 seconds. Set to 0 to disable.',
         ),
-    preset: z
-        .enum(['reviewer', 'tester', 'architect', 'refactorer', 'researcher'])
-        .optional()
-        .describe('Preset archetype for specialized system instructions and role.'),
 });
 
 interface DynamicEntry {
@@ -1315,19 +1364,19 @@ export const buildProfile = (
 
     const useTodoTools = input.useTodoTools ?? false;
     const rawSystemPrompt = input.systemPrompt.trim();
-    const presetPrompt = input.preset ? AGENT_PRESETS[input.preset] : undefined;
-    const combinedSystemPrompt = presetPrompt
-        ? `${presetPrompt}\n\n${rawSystemPrompt}`
-        : rawSystemPrompt;
     const noTodoNotice =
         'You do not have access to TODO tools. Do not use or call any todo tools (todo_*, todo---*).';
     const systemPrompt = !useTodoTools
-        ? `${combinedSystemPrompt}\n\n${noTodoNotice}`
-        : combinedSystemPrompt;
+        ? `${rawSystemPrompt}\n\n${noTodoNotice}`
+        : rawSystemPrompt;
 
     const finalEnabledServers =
         input.enabledServers ??
         (base.enabledServers && base.enabledServers.length > 0 ? base.enabledServers : undefined);
+
+    // The orchestrator has no file or shell tools. Delegated agents do the real work,
+    // so they get standard tool access unless the caller passes an explicit override.
+    const parentIsOrchestrator = base.id === ORCHESTRATOR_AGENT_PROFILE.id;
 
     return {
         ...base,
@@ -1339,8 +1388,19 @@ export const buildProfile = (
         maxIterations: 0,
         maxTokens: input.maxTokens ?? base.maxTokens,
         includeContextFiles: input.includeContextFiles ?? base.includeContextFiles,
-        useAiderTools: input.useAiderTools ?? base.useAiderTools,
-        usePowerTools: input.usePowerTools ?? base.usePowerTools,
+        includeRepoMap:
+            input.includeRepoMap ?? (parentIsOrchestrator ? true : base.includeRepoMap),
+        useExtensionTools:
+            input.useExtensionTools ?? (parentIsOrchestrator ? true : base.useExtensionTools),
+        disabledExtensionTools:
+            input.disabledExtensionTools ??
+            (parentIsOrchestrator ? [] : base.disabledExtensionTools),
+        useAiderTools: input.useAiderTools ?? (parentIsOrchestrator ? true : base.useAiderTools),
+        usePowerTools: input.usePowerTools ?? (parentIsOrchestrator ? true : base.usePowerTools),
+        // The orchestrator denies its own file and shell tools; delegated agents need them.
+        toolApprovals: input.toolApprovals
+            ? { ...(parentIsOrchestrator ? {} : base.toolApprovals), ...input.toolApprovals }
+            : (parentIsOrchestrator ? {} : base.toolApprovals),
         useTodoTools,
         useSkillsTools: input.useSkillsTools ?? base.useSkillsTools,
         useTaskTools: input.useTaskTools ?? base.useTaskTools,
@@ -1406,18 +1466,6 @@ export default class DynamicAgentsExtension implements Extension {
             : (DEFAULT_CONFIG.maxSubagentDepth ?? 2);
     }
 
-    getModes(_context: ExtensionContext): ModeDefinition[] {
-        return [
-            {
-                name: 'orchestrator',
-                label: 'Orchestrator',
-                description:
-                    'Decomposes the task into subtasks and delegates them to dynamic subagents',
-                icon: 'GoStack',
-            },
-        ];
-    }
-
     getAgents(_context: ExtensionContext): AgentProfile[] {
         return [
             this.orchestratorProfileEdits.get('dynamic-agents-orchestrator') ??
@@ -1448,7 +1496,7 @@ export default class DynamicAgentsExtension implements Extension {
                     if (!parsed.text) {
                         taskContext.addLogMessage(
                             'warning',
-                            'Usage: /goal [-r <rounds>] [-p <preset>] [-t <timeout>] <verifiable goal>\nExample: /goal -r 5 npm test passes',
+                            'Usage: /goal [-r <rounds>] [-t <timeout>] <verifiable goal>\nExample: /goal -r 5 npm test passes',
                         );
                         return;
                     }
@@ -1456,9 +1504,6 @@ export default class DynamicAgentsExtension implements Extension {
                     const modifiers: string[] = [];
                     if (parsed.rounds !== undefined) {
                         modifiers.push(`maxRounds: ${parsed.rounds}`);
-                    }
-                    if (parsed.preset) {
-                        modifiers.push(`preset: ${parsed.preset}`);
                     }
                     if (parsed.timeoutSeconds !== undefined) {
                         modifiers.push(`idleTimeoutSeconds: ${parsed.timeoutSeconds}`);
@@ -1469,7 +1514,7 @@ export default class DynamicAgentsExtension implements Extension {
                             ? `Achieve this verifiable goal using run_dynamic_agent_goal (${modifiers.join(', ')}):\n${parsed.text}`
                             : `Achieve this verifiable goal using run_dynamic_agent_goal:\n${parsed.text}`;
 
-                    await taskContext.runPrompt(prompt, 'orchestrator');
+                    await taskContext.runPrompt(prompt);
                 },
             },
             {
@@ -1494,7 +1539,7 @@ export default class DynamicAgentsExtension implements Extension {
                     if (!parsed.text) {
                         taskContext.addLogMessage(
                             'warning',
-                            'Usage: /debate [-r <rounds>] [-p <preset>] [-t <timeout>] <topic or decision>\nExample: /debate -r 3 TypeScript vs Rust for backend',
+                            'Usage: /debate [-r <rounds>] [-t <timeout>] <topic or decision>\nExample: /debate -r 3 TypeScript vs Rust for backend',
                         );
                         return;
                     }
@@ -1502,9 +1547,6 @@ export default class DynamicAgentsExtension implements Extension {
                     const modifiers: string[] = [];
                     if (parsed.rounds !== undefined) {
                         modifiers.push(`rounds: ${parsed.rounds}`);
-                    }
-                    if (parsed.preset) {
-                        modifiers.push(`preset: ${parsed.preset}`);
                     }
                     if (parsed.timeoutSeconds !== undefined) {
                         modifiers.push(`idleTimeoutSeconds: ${parsed.timeoutSeconds}`);
@@ -1515,7 +1557,7 @@ export default class DynamicAgentsExtension implements Extension {
                             ? `Conduct a structured debate on this topic using run_agent_debate (${modifiers.join(', ')}):\n${parsed.text}`
                             : `Conduct a structured debate on this topic using run_agent_debate:\n${parsed.text}`;
 
-                    await taskContext.runPrompt(prompt, 'orchestrator');
+                    await taskContext.runPrompt(prompt);
                 },
             },
         ];
@@ -1586,27 +1628,14 @@ export default class DynamicAgentsExtension implements Extension {
         event: AgentStartedEvent,
         context: ExtensionContext,
     ): Promise<undefined | Partial<AgentStartedEvent>> {
-        if (event.mode !== 'orchestrator') {
+        if (event.agentProfile?.id !== 'dynamic-agents-orchestrator') {
             return undefined;
         }
-
-        const alreadyInjected = event.contextMessages.some(
-            (msg) => msg.id === 'dynamic-agents-orchestrator-user',
-        );
-        if (alreadyInjected) {
-            return undefined;
-        }
-
-        context.log(
-            'Orchestrator mode active - prepending orchestration instructions to context messages',
-            'info',
-        );
 
         // Populate enabledServers on the orchestrator profile if needed
         const config = readExtensionConfig(this.configPath);
         if (
             config.enableAllMcpServersByDefault &&
-            event.agentProfile &&
             (!event.agentProfile.enabledServers || event.agentProfile.enabledServers.length === 0)
         ) {
             try {
@@ -1625,24 +1654,7 @@ export default class DynamicAgentsExtension implements Extension {
             }
         }
 
-        const orchestratorUserMessage = {
-            id: 'dynamic-agents-orchestrator-user',
-            role: 'user' as const,
-            content: ORCHESTRATOR_USER_MESSAGE,
-        };
-        const orchestratorAssistantMessage = {
-            id: 'dynamic-agents-orchestrator-assistant',
-            role: 'assistant' as const,
-            content: ORCHESTRATOR_ASSISTANT_MESSAGE,
-        };
-
-        return {
-            contextMessages: [
-                orchestratorUserMessage,
-                orchestratorAssistantMessage,
-                ...event.contextMessages,
-            ],
-        };
+        return undefined;
     }
 
     async onSubagentStarted(
@@ -1770,7 +1782,7 @@ export default class DynamicAgentsExtension implements Extension {
 
     getTools(
         context: ExtensionContext,
-        mode: string,
+        _mode: string,
         agentProfile: AgentProfile,
     ): ToolDefinition[] {
         const runDynamicAgent: ToolDefinition<typeof runInputSchema> = {
@@ -1817,7 +1829,10 @@ export default class DynamicAgentsExtension implements Extension {
                     input.useSkillsTools !== undefined ||
                     input.useTaskTools !== undefined ||
                     input.useMemoryTools !== undefined ||
-                    input.preset !== undefined ||
+                    input.includeRepoMap !== undefined ||
+                    input.useExtensionTools !== undefined ||
+                    input.disabledExtensionTools !== undefined ||
+                    input.toolApprovals !== undefined ||
                     input.contextFiles !== undefined;
 
                 const resolvedServers = await resolveEnabledServers(
@@ -1920,7 +1935,10 @@ export default class DynamicAgentsExtension implements Extension {
                     useSkillsTools: input.useSkillsTools,
                     useTaskTools: input.useTaskTools,
                     useMemoryTools: input.useMemoryTools,
-                    preset: input.preset,
+                    includeRepoMap: input.includeRepoMap,
+                    useExtensionTools: input.useExtensionTools,
+                    disabledExtensionTools: input.disabledExtensionTools,
+                    toolApprovals: input.toolApprovals,
                     contextFiles: input.contextFiles,
                     idleTimeoutSeconds: input.idleTimeoutSeconds,
                 };
@@ -2052,7 +2070,10 @@ export default class DynamicAgentsExtension implements Extension {
                             useSkillsTools: input.useSkillsTools,
                             useTaskTools: input.useTaskTools,
                             useMemoryTools: input.useMemoryTools,
-                            preset: input.preset,
+                            includeRepoMap: input.includeRepoMap,
+                            useExtensionTools: input.useExtensionTools,
+                            disabledExtensionTools: input.disabledExtensionTools,
+                            toolApprovals: input.toolApprovals,
                             contextFiles: input.contextFiles,
                             idleTimeoutSeconds: input.idleTimeoutSeconds,
                         };
@@ -2112,8 +2133,10 @@ export default class DynamicAgentsExtension implements Extension {
             },
         };
 
-        if (mode === 'orchestrator') {
-            return [
+        if (agentProfile.id === ORCHESTRATOR_AGENT_PROFILE.id) {
+            // Allowlist, not a denylist: a tool that is not named here never reaches the
+            // orchestrator, even when a later change adds it to this extension.
+            const orchestratorTools = [
                 {
                     ...runDynamicAgent,
                     description: ORCHESTRATOR_DESCRIPTION,
@@ -2121,7 +2144,10 @@ export default class DynamicAgentsExtension implements Extension {
                 runDynamicAgentGoal,
                 runAgentDebate,
                 listDynamicSubagents,
-            ];
+            ] as ToolDefinition[];
+            return orchestratorTools.filter((tool) =>
+                ORCHESTRATOR_ALLOWED_TOOL_NAMES.has(tool.name),
+            );
         }
 
         return [runDynamicAgent, runDynamicAgentGoal, runAgentDebate, listDynamicSubagents];

@@ -179,9 +179,11 @@ Examples:
 
 ---
 
-## Orchestrator mode
+## Orchestrator agent
 
-Select the **Orchestrator** mode from the mode dropdown. In this mode, the main agent decomposes tasks into focused subtasks and delegates them to dynamic subagents, goal loops, or debate sequences.
+Select the **Orchestrator** agent profile. The orchestrator decomposes tasks into focused subtasks and delegates them to dynamic subagents, goal loops, or debate sequences.
+
+The orchestrator is a manager. It has no file reading, file writing, or shell execution tools. Every task runs inside a delegated subagent.
 
 For tool selection: use `run_dynamic_agent` for single self-contained subtasks, `run_dynamic_agent_goal` for tasks with a verifiable end state that may require multiple iterations, and `run_agent_debate` for contested design or architectural decisions.
 
